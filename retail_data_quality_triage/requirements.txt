@@ -1,0 +1,5 @@
+pandas
+duckdb
+sqlalchemy
+python-dotenv
+pytest
