@@ -1,0 +1,46 @@
+{
+  "duplicates_removed": 0,
+  "rerun_used": false,
+  "issues": [
+    {
+      "issue_id": "DDUP_0001",
+      "issue_type": "duplicate_rows",
+      "table": "fact_sales_normalized",
+      "columns": [],
+      "severity": "medium",
+      "metric": 0.03474705882352941,
+      "evidence_rows": 35442,
+      "description": "Detected 35442 duplicated rows in fact_sales_normalized.",
+      "impact_score": 1.1946,
+      "affected_reports": [
+        "daily sales summary",
+        "top products"
+      ],
+      "agent_trace": [
+        "detector_agent",
+        "ranking_agent"
+      ]
+    },
+    {
+      "issue_id": "DFK_0001",
+      "issue_type": "referential_integrity_break",
+      "table": "fact_sales_normalized",
+      "columns": [
+        "campaign_sk"
+      ],
+      "severity": "medium",
+      "metric": 0.013629411764705883,
+      "evidence_rows": 13902,
+      "description": "Column campaign_sk contains 13902 values not found in dim_campaigns.campaign_sk.",
+      "impact_score": 1.0818,
+      "affected_reports": [
+        "sales by store",
+        "sales by product category"
+      ],
+      "agent_trace": [
+        "detector_agent",
+        "ranking_agent"
+      ]
+    }
+  ]
+}

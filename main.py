@@ -1,5 +1,9 @@
+from astrion_dq.cli import app
+
+
 def main():
-    print("Retail Data Quality Triage pipeline entry point.")
+    app()
+
 
 if __name__ == "__main__":
     main()

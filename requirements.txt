@@ -1,5 +1,8 @@
-pandas
-duckdb
-sqlalchemy
-python-dotenv
-pytest
+pandas>=2.0.0
+duckdb>=1.0.0
+sqlalchemy>=2.0.0
+python-dotenv>=1.0.0
+typer>=0.9.0
+pydantic>=2.0.0
+matplotlib>=3.7.0
+pytest>=7.0.0
