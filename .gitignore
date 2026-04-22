@@ -6,8 +6,9 @@ __pycache__/
 .venv/
 venv/
 
-# Environment
+# Environment -- never commit real keys
 .env
+config/.env
 
 # Databases
 *.db
@@ -39,3 +40,4 @@ data/injected/retail/*.csv
 *.egg-info/
 dist/
 build/
+.claude/worktrees/
