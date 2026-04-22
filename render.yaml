@@ -1,0 +1,103 @@
+# ── Astrion DQ — Render.com Blueprint ─────────────────────────────────────────
+#
+# DEPLOYMENT GUIDE
+# ────────────────
+# 1. Push this repo to GitHub.
+# 2. Go to https://dashboard.render.com → New → Blueprint.
+# 3. Connect your GitHub repo — Render detects this file automatically.
+# 4. Render creates both services in one click.
+# 5. After deploy, set the three secret env vars in each service's Environment tab:
+#    - OPENROUTER_API_KEY   (get from https://openrouter.ai/keys)
+#    - ASTRION_API_TOKEN    (any secure random string, or leave blank for no auth)
+# 6. Trigger a manual deploy or push to the connected branch to ship.
+#
+# SERVICES
+# ────────
+#  astrion-dq-api        FastAPI REST layer  → https://astrion-dq-api.onrender.com
+#  astrion-dq-dashboard  Streamlit dashboard → https://astrion-dq-dashboard.onrender.com
+#
+# ENVIRONMENT VARIABLES (set in Render dashboard, not here — never put secrets in YAML)
+#  OPENROUTER_API_KEY   Required for LLM executive summaries + SQL Agent.
+#                       Without it the system still works in template-only mode.
+#  ASTRION_API_TOKEN    Optional Bearer token for FastAPI. Leave blank for open access.
+#
+# NOTE: Free-tier Render services spin down after 15 minutes of inactivity.
+#       Cold starts can take 30-60 seconds. Upgrade to Starter ($7/mo) to keep warm.
+# ──────────────────────────────────────────────────────────────────────────────
+
+version: "1"
+
+services:
+
+  # ── FastAPI REST API ─────────────────────────────────────────────────────────
+  - type: web
+    name: astrion-dq-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    # Override the default CMD to start the FastAPI/uvicorn server
+    dockerCommand: uvicorn astrion_dq.api.app:app --host 0.0.0.0 --port 10000
+    # Render assigns port 10000 for web services by default
+    healthCheckPath: /health
+    autoDeploy: true
+    plan: free          # Change to starter/standard for always-on + more RAM
+    envVars:
+      # ── LLM (optional — system works without it) ──────────────────────────
+      - key: OPENROUTER_API_KEY
+        sync: false     # ← set manually in Render dashboard (never commit secrets)
+      - key: OPENROUTER_MODEL
+        value: anthropic/claude-sonnet-4-6
+      - key: LLM_TOP_N
+        value: "5"
+
+      # ── API security ──────────────────────────────────────────────────────
+      - key: ASTRION_API_TOKEN
+        sync: false     # ← optional — leave blank to run in unauthenticated dev mode
+
+      # ── Python runtime ────────────────────────────────────────────────────
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO
+
+  # ── Streamlit Dashboard ──────────────────────────────────────────────────────
+  - type: web
+    name: astrion-dq-dashboard
+    env: docker
+    dockerfilePath: ./Dockerfile
+    # Override CMD to launch the Streamlit dashboard
+    # --server.headless true  → no browser, no CORS pop-up on cloud
+    # --server.enableCORS false → Render handles TLS termination upstream
+    # --server.enableXsrfProtection false → avoids redirect loops behind proxy
+    dockerCommand: >-
+      streamlit run dashboard/app.py
+      --server.port 10000
+      --server.address 0.0.0.0
+      --server.headless true
+      --server.enableCORS false
+      --server.enableXsrfProtection false
+    healthCheckPath: /_stcore/health
+    autoDeploy: true
+    plan: free
+    envVars:
+      # ── LLM (same key — both services need it for SQL Agent / summaries) ──
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: anthropic/claude-sonnet-4-6
+      - key: LLM_TOP_N
+        value: "5"
+
+      # ── Link dashboard → API (Streamlit can call the REST API if needed) ──
+      - key: ASTRION_API_URL
+        fromService:
+          type: web
+          name: astrion-dq-api
+          envVarKey: RENDER_EXTERNAL_URL
+
+      # ── Python runtime ────────────────────────────────────────────────────
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+        value: "false"

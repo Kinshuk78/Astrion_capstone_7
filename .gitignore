@@ -40,4 +40,10 @@ data/injected/retail/*.csv
 *.egg-info/
 dist/
 build/
-.claude/worktrees/
+
+# AI tooling — local only, never push
+.claude/
+.gstack/
+
+# Generated outputs — reproducible from CLI
+outputs/

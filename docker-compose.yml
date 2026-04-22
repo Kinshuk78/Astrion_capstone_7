@@ -1,0 +1,86 @@
+# ── Astrion DQ — Docker Compose ───────────────────────────────────────────────
+#
+# TEAM NOTE: Docker Compose is for local development and demos.
+# For cloud deployment on Render, see render.yaml.
+#
+# Services:
+#   pipeline  — runs the full triage workflow (batch job, exits when done)
+#   api       — FastAPI REST server on port 8000
+#   dashboard — Streamlit UI on port 8501
+#
+# Shared volumes:
+#   ./outputs         → persists workflow results between containers
+#   ./data/injected   → persists injected datasets
+#   ./data/raw/retail → clean retail CSVs
+#
+# Usage:
+#   docker-compose up dashboard        # Launch UI only
+#   docker-compose up api              # Launch REST API only
+#   docker-compose run pipeline inject # Inject issues then exit
+#   docker-compose run pipeline astrion-dq triage --source injected
+#   docker-compose up                  # Run everything
+
+version: "3.9"
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  env_file:
+    - config/.env
+  volumes:
+    - ./outputs:/app/outputs
+    - ./data/injected:/app/data/injected
+    - ./data/raw/retail:/app/data/raw/retail
+    - ./data/processed:/app/data/processed
+
+services:
+
+  # ── Batch pipeline job ──────────────────────────────────────────────────────
+  pipeline:
+    <<: *common
+    container_name: astrion_pipeline
+    command: ["astrion-dq", "triage", "--source", "injected", "--auto-approve"]
+    restart: "no"   # batch job — run once and exit
+
+  # ── FastAPI REST API ────────────────────────────────────────────────────────
+  api:
+    <<: *common
+    container_name: astrion_api
+    command:
+      - uvicorn
+      - astrion_dq.api.app:app
+      - --host=0.0.0.0
+      - --port=8000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Streamlit dashboard ─────────────────────────────────────────────────────
+  dashboard:
+    <<: *common
+    container_name: astrion_dashboard
+    command:
+      - streamlit
+      - run
+      - dashboard/app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
