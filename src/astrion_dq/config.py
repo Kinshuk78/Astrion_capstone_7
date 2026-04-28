@@ -35,7 +35,7 @@ LLM_TOP_N           = int(os.getenv("LLM_TOP_N", "5"))
 # When unset, all agent endpoints fall back gracefully to deterministic output.
 # ---------------------------------------------------------------------------
 
-OPENAI_MODEL                    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL                    = os.getenv("OPENAI_MODEL", "gpt-4.1")
 AGENT_MAX_RETRIES               = int(os.getenv("AGENT_MAX_RETRIES", "3"))
 AGENT_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("AGENT_CIRCUIT_BREAKER_THRESHOLD", "3"))
 AGENT_RESPONSE_MIN_SCORE        = float(os.getenv("AGENT_RESPONSE_MIN_SCORE", "0.70"))

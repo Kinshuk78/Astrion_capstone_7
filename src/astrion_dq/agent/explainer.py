@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _MAX_ISSUES = int(os.getenv("AGENT_MAX_ISSUES", "10"))
 _MAX_DESC_CHARS = int(os.getenv("AGENT_MAX_DESC_CHARS", "200"))
 _CACHE_TTL = int(os.getenv("AGENT_CACHE_TTL", "3600"))
-_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
 _cache: dict[str, tuple[list, float]] = {}
 
