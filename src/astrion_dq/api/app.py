@@ -305,6 +305,214 @@ def get_run(
     raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
 
 
+# ---------------------------------------------------------------------------
+# Agent Layer endpoints
+# POST /analyze          -- triage + agent explanations + report (async job)
+# POST /explain          -- business explanations for pre-computed issues
+# POST /prioritise       -- AI-ranked priority list with justifications
+# POST /generate-fix     -- SQL + Python fix code for a single issue
+# POST /report           -- executive business summary report
+# ---------------------------------------------------------------------------
+
+class ExplainRequest(BaseModel):
+    issues: List[dict]
+    table_sizes: dict = {}
+
+
+class PrioritiseRequest(BaseModel):
+    issues: List[dict]
+    table_sizes: dict = {}
+
+
+class GenerateFixRequest(BaseModel):
+    issue: dict
+    table_schema: List[dict] = []
+
+
+class ReportRequest(BaseModel):
+    issues: List[dict]
+    run_id: str = ""
+    table_sizes: dict = {}
+
+
+class AnalyzeRequest(BaseModel):
+    source: str = "injected"
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        if v not in ("clean", "injected"):
+            raise ValueError("source must be 'clean' or 'injected'")
+        return v
+
+
+def _run_analyze_job(job_id: str, source: str) -> None:
+    """Background worker: run triage then agent explain + report."""
+    with _triage_lock:
+        try:
+            triage_result = _execute_triage(source)
+            issues = triage_result.ranked_issues
+
+            from astrion_dq.agent import explain_issues, generate_report
+            from astrion_dq.agent.key_manager import APIKeyManager
+
+            key_manager = APIKeyManager.from_env()
+            explanations = explain_issues(issues, key_manager=key_manager)
+            report = generate_report(
+                issues,
+                run_id=triage_result.run_id,
+                key_manager=key_manager,
+            )
+
+            with _jobs_lock:
+                _jobs[job_id].update({
+                    "status": "done",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "result": {
+                        **triage_result.model_dump(),
+                        "explanations": explanations,
+                        "report": report,
+                    },
+                })
+        except Exception as exc:
+            logger.exception("Analyze job %s failed: %s", job_id, exc)
+            with _jobs_lock:
+                _jobs[job_id].update({
+                    "status": "error",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error": str(exc),
+                })
+
+
+@app.post("/analyze", response_model=JobSubmitResponse, status_code=202)
+@limiter.limit(_RATE_LIMIT)
+def analyze_submit(
+    request: Request,
+    req: AnalyzeRequest,
+    _auth: None = Depends(_require_token),
+) -> JobSubmitResponse:
+    """Submit a full analysis job (triage + AI explanations + executive report).
+
+    Returns 202 with a job_id immediately. Poll ``GET /jobs/{job_id}`` for
+    completion. The result includes ranked_issues, explanations, and report.
+    Falls back to deterministic output when no OpenAI keys are configured.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status": "running",
+            "source": req.source,
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+        }
+    _executor.submit(_run_analyze_job, job_id, req.source)
+    return JobSubmitResponse(
+        job_id=job_id,
+        status="running",
+        poll_url=f"/jobs/{job_id}",
+    )
+
+
+@app.post("/explain")
+def explain(
+    req: ExplainRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return business-language explanations for a pre-computed issue list.
+
+    Sends structured summaries (not raw data) to the OpenAI API.
+    Falls back to deterministic text when no API keys are configured.
+    All outputs are validated for schema compliance before being returned.
+    """
+    if not req.issues:
+        raise HTTPException(status_code=422, detail="issues list must not be empty.")
+
+    from astrion_dq.agent import explain_issues
+    from astrion_dq.agent.key_manager import APIKeyManager
+
+    explanations = explain_issues(
+        req.issues,
+        table_sizes=req.table_sizes or None,
+        key_manager=APIKeyManager.from_env(),
+    )
+    used_fallback = any(e.get("source") == "fallback" for e in explanations)
+    return {"explanations": explanations, "used_fallback": used_fallback}
+
+
+@app.post("/prioritise")
+def prioritise(
+    req: PrioritiseRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return a priority-ranked issue list with AI-generated justifications.
+
+    Falls back to BIS-sorted deterministic ranking when no API keys are
+    configured or the LLM response fails validation.
+    """
+    if not req.issues:
+        raise HTTPException(status_code=422, detail="issues list must not be empty.")
+
+    from astrion_dq.agent import prioritise_issues
+    from astrion_dq.agent.key_manager import APIKeyManager
+
+    prioritised = prioritise_issues(
+        req.issues,
+        table_sizes=req.table_sizes or None,
+        key_manager=APIKeyManager.from_env(),
+    )
+    used_fallback = any(p.get("source") == "fallback" for p in prioritised)
+    return {"prioritised_issues": prioritised, "used_fallback": used_fallback}
+
+
+@app.post("/generate-fix")
+def generate_fix(
+    req: GenerateFixRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Generate SQL and Python fix code for a single data quality issue.
+
+    Uses only columns and tables listed in the provided schema or inferred
+    from the issue dict. Post-generation validation rejects code that
+    references columns not in the schema and falls back to templates.
+    """
+    if not req.issue:
+        raise HTTPException(status_code=422, detail="issue must not be empty.")
+
+    from astrion_dq.agent import generate_fix_code
+    from astrion_dq.agent.key_manager import APIKeyManager
+
+    fix = generate_fix_code(
+        req.issue,
+        extra_schema=req.table_schema or None,
+        key_manager=APIKeyManager.from_env(),
+    )
+    return fix
+
+
+@app.post("/report")
+def report(
+    req: ReportRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Generate an executive business summary report for a set of ranked issues.
+
+    The report covers: overall data health, top risks, and recommended actions.
+    Fallback returns a deterministic report when the LLM is unavailable.
+    """
+    if not req.issues:
+        from astrion_dq.agent.fallback import fallback_report
+        return fallback_report([], req.run_id)
+
+    from astrion_dq.agent import generate_report
+    from astrion_dq.agent.key_manager import APIKeyManager
+
+    return generate_report(
+        req.issues,
+        run_id=req.run_id,
+        table_sizes=req.table_sizes or None,
+        key_manager=APIKeyManager.from_env(),
+    )
+
+
 @app.get("/triage/report.pdf")
 @limiter.limit("5/minute")
 def triage_report_pdf(

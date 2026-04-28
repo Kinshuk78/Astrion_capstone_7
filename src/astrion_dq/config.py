@@ -28,6 +28,21 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-6")
 LLM_TOP_N           = int(os.getenv("LLM_TOP_N", "5"))
 
+# ---------------------------------------------------------------------------
+# OpenAI Agent Layer (hackathon-openai-agent branch)
+# Powers the /explain, /prioritise, /generate-fix, /report, /analyze endpoints.
+# Set OPENAI_API_KEYS (comma-separated) or OPENAI_API_KEY (single key).
+# When unset, all agent endpoints fall back gracefully to deterministic output.
+# ---------------------------------------------------------------------------
+
+OPENAI_MODEL                    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+AGENT_MAX_RETRIES               = int(os.getenv("AGENT_MAX_RETRIES", "3"))
+AGENT_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("AGENT_CIRCUIT_BREAKER_THRESHOLD", "3"))
+AGENT_RESPONSE_MIN_SCORE        = float(os.getenv("AGENT_RESPONSE_MIN_SCORE", "0.70"))
+AGENT_MAX_ISSUES                = int(os.getenv("AGENT_MAX_ISSUES", "10"))
+AGENT_MAX_DESC_CHARS            = int(os.getenv("AGENT_MAX_DESC_CHARS", "200"))
+AGENT_CACHE_TTL                 = int(os.getenv("AGENT_CACHE_TTL", "3600"))
+
 RAW_RETAIL_DIR   = PROJECT_ROOT / "data" / "raw" / "retail"
 RAW_ROOT_DIR     = PROJECT_ROOT / "data" / "raw"
 INJECTED_DIR     = PROJECT_ROOT / "data" / "injected" / "retail"
