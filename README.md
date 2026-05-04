@@ -3,7 +3,7 @@
 **Automatic data quality checker for retail databases — built as an academic capstone project.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-116%20passing-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -50,7 +50,7 @@ You need these installed on your machine before anything else:
 
 ---
 
-## Getting started (5 minutes)
+## Getting started (fresh clone)
 
 ### 1. Clone and install
 
@@ -58,14 +58,20 @@ You need these installed on your machine before anything else:
 git clone https://github.com/Kinshuk78/Astrion_capstone_7.git
 cd Astrion_capstone_7
 
-# Create a virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate        # Mac / Linux
-.venv\Scripts\activate           # Windows
+# Create a virtual environment
+python3 -m venv .venv
 
-# Install the package and all dependencies
-pip install -e ".[dev]"
+# Activate it
+source .venv/bin/activate        # macOS / Linux
+# .venv\Scripts\activate         # Windows PowerShell
+
+# Install the package and dev dependencies
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
 ```
+
+All commands below assume the virtual environment is activated.
+If `astrion-dq` is not found on your machine, use `python -m astrion_dq.cli` instead.
 
 ### 2. Set up your API key (optional)
 
@@ -75,26 +81,41 @@ cp config/.env.example config/.env
 # OPENROUTER_API_KEY=sk-or-v1-your-key-here
 ```
 
+Never put a real key in `config/.env.example` or any tracked file. Keep real secrets only in
+`config/.env` or your deployment platform's secret environment-variable settings.
+
 If you skip this step, everything still works — you just won't get the LLM-powered summary or SQL Agent chat.
 
 ### 3. Run your first triage
 
 ```bash
 # Step 1: Save a baseline snapshot of your clean data (run once)
-astrion-dq snapshot
+python -m astrion_dq.cli snapshot
 
 # Step 2: Inject fake problems into a copy of the data (creates test ground truth)
-astrion-dq inject
+python -m astrion_dq.cli inject
 
 # Step 3: Run the full triage
-astrion-dq triage --source injected
+python -m astrion_dq.cli triage --source injected
 
 # Step 4: Open the dashboard to see results
-astrion-dq dashboard
-# Visit http://localhost:8501 in your browser
+python -m astrion_dq.cli dashboard
+
+# If you prefer launching Streamlit directly:
+# python -m streamlit run dashboard/app.py --server.port 8501 --server.headless false
 ```
 
-That's it. You should see ranked issues, a resolution report, and strategy comparison charts.
+Then open:
+
+```text
+http://localhost:8501
+```
+
+That gives you:
+- ranked injected issues in `Triage Issues`
+- the markdown report in `Markdown Report`
+- A/B/C workflow comparison in `Strategy Comparison`
+- the SQL Assistant if `OPENROUTER_API_KEY` is configured
 
 ---
 
@@ -106,7 +127,7 @@ Astrion_capstone_7/
 ├── src/astrion_dq/          <- All the Python source code
 │   ├── api/app.py           <- REST API (FastAPI)
 │   ├── checks/
-│   │   ├── detect.py        <- The 7 issue detectors (this is where detection happens)
+│   │   ├── detect.py        <- The 7 issue detectors (this is where  detection happens)
 │   │   └── drift.py         <- Statistical drift detection (PSI + KS test)
 │   ├── graph/
 │   │   ├── nodes.py         <- Each step of the pipeline as a function
@@ -123,7 +144,7 @@ Astrion_capstone_7/
 ├── dashboard/app.py         <- Streamlit web dashboard (7 tabs)
 ├── data/raw/retail/         <- The sample retail dataset (7 CSV files)
 ├── outputs/                 <- Where results are written (JSON, markdown, PDF)
-├── tests/                   <- 112 automated tests
+├── tests/                   <- 116 automated tests
 ├── Dockerfile               <- Container build file
 ├── docker-compose.yml       <- Run everything with Docker
 └── render.yaml              <- One-click cloud deployment on Render.com
@@ -226,13 +247,19 @@ astrion-dq dashboard             # Open the Streamlit web dashboard
 astrion-dq serve                 # Start the REST API server (port 8000)
 ```
 
+If the `astrion-dq` console command is unavailable in your shell, the equivalent form is:
+
+```bash
+python -m astrion_dq.cli <command>
+```
+
 Every triage run logs a record to `outputs/run_log.jsonl` so you can audit what ran and when.
 
 ---
 
 ## Dashboard
 
-Launch with `astrion-dq dashboard` then open [http://localhost:8501](http://localhost:8501).
+Launch with `astrion-dq dashboard` or `python -m astrion_dq.cli dashboard`, then open [http://localhost:8501](http://localhost:8501).
 
 The dashboard has 7 tabs:
 
@@ -243,8 +270,12 @@ The dashboard has 7 tabs:
 | **Markdown Report** | The full triage report with SQL fix code |
 | **Run History** | Every previous triage run with timestamps |
 | **Architecture** | Diagram of the pipeline and how it works |
-| **SQL Assistant** | Chat with an LLM that knows your database schema. Ask it to explain issues, write investigation queries, or fix SQL errors. SQL blocks in responses are auto-executed and results shown inline. Requires `OPENROUTER_API_KEY`. |
-| **Upload & Analyze** | Upload any CSV file(s). The system runs a full triage automatically — no injection step needed. Results show in the same format. |
+| **SQL Assistant** | Chat with an LLM that knows the currently loaded retail or uploaded dataset. It can explain issues, write DuckDB SQL, and auto-executes SQL blocks inline. Requires `OPENROUTER_API_KEY`. |
+| **Upload & Analyze** | Upload your own CSVs and run a verified workflow: `profiler -> detector -> SQL cross-validation -> ranker`. If you also upload a baseline dataset, it adds snapshot-style drift detection so uploaded runs align with retail CLI drift behavior. |
+
+Notes:
+- `Run Triage` in the sidebar refreshes the retail results and makes the retail dataset available to the SQL Assistant.
+- `Upload & Analyze` keeps its own results in the current Streamlit session. Those uploaded results do not overwrite the retail CLI output files shown in `Triage Issues`.
 
 ---
 
@@ -297,15 +328,13 @@ When you run `astrion-dq evaluate`, it runs three versions of the pipeline and c
 | **B Supervisor** | A + SQL cross-validation + analyst review gate | Higher confidence, fewer false positives |
 | **C Full** | B + statistical drift detection | Catching gradual data corruption |
 
-Current results (v0.6.0, injected data, high sensitivity):
+Run the comparison with:
 
-| Strategy | Precision | Recall | F1 | Noise Rate |
-|---|---|---|---|---|
-| A Baseline | 1.000 | 0.750 | 0.857 | 0.000 |
-| B Supervisor | 1.000 | 0.750 | 0.857 | 0.000 |
-| C Full | 1.000 | 0.750 | 0.857 | 0.000 |
+```bash
+astrion-dq evaluate
+```
 
-Precision = 1.0 means zero false positives. The 0.25 recall gap is one missed issue (`numeric_outliers`) that falls just below the detection threshold on the synthetic dataset.
+Results are written to `outputs/evaluation_comparison.json` and shown in the dashboard's `Strategy Comparison` tab.
 
 ---
 
@@ -360,6 +389,7 @@ Your live URLs will be:
 ## Configuration reference
 
 All settings live in `src/astrion_dq/config.py`. You can override most of them with environment variables in `config/.env`.
+For GitHub / Render / Docker deployment, prefer platform-managed secret environment variables over committed files.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -376,13 +406,13 @@ All settings live in `src/astrion_dq/config.py`. You can override most of them w
 
 ```bash
 # Install with dev dependencies
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 
-# Run all 112 tests
-pytest tests/ -v
+# Run all 116 tests
+python -m pytest tests/ -v
 
 # Run just the new feature tests
-pytest tests/test_resolution_advice.py tests/test_upload_triage.py tests/test_sql_agent.py -v
+python -m pytest tests/test_resolution_advice.py tests/test_upload_triage.py tests/test_sql_agent.py -v
 
 # Lint
 ruff check src/
@@ -430,17 +460,17 @@ The DuckDB database runs in memory and is shared by the whole process. If two pe
 **2. Data is not saved between restarts**
 When deployed on Render.com (or any ephemeral server), output files like `run_log.jsonl` and ranked issues JSON are lost when the server restarts. For persistent storage you would need to add an external database or object storage (S3, Supabase, etc.).
 
-**3. Upload triage has no SQL verification step**
-When you upload your own CSV in the Upload & Analyze tab, the pipeline skips the SQL cross-validation step (debugger node). Detection results are based on pandas checks only, which means slightly higher false positive rates compared to the full retail pipeline.
+**3. Upload triage is a separate dashboard workflow**
+The Upload & Analyze tab now uses SQL cross-validation and optional baseline drift, but it still runs as a dashboard-local workflow. Its results live in Streamlit session state and do not replace the retail CLI output files used by the main `Triage Issues` tab.
 
 **4. Retail dataset only (for the CLI pipeline)**
 The CLI commands (`triage`, `evaluate`, etc.) are wired to the 7 retail CSVs in `data/raw/retail/`. There is no built-in way to point the CLI at a different database schema without code changes. The Upload & Analyze tab is the workaround for arbitrary datasets.
 
-**5. LLM summary is fire-and-forget**
-If the OpenRouter API call fails mid-run (network timeout, rate limit, quota exceeded), the report is generated without the LLM section. There is no retry logic. The report still contains the full deterministic SQL section.
+**5. LLM features still depend on OpenRouter availability and credits**
+The SQL Assistant and LLM-powered summaries are optional. If the OpenRouter key is missing, credits are exhausted, or the upstream API is unavailable, the deterministic parts of the system still work, but assistant-style responses can fail or fall back.
 
-**6. Drift detection requires a baseline snapshot**
-Statistical drift detection only works if you have previously run `astrion-dq snapshot` on clean data. Without a baseline, the drift detector is skipped silently.
+**6. Drift detection requires a baseline reference**
+Retail CLI drift uses the saved snapshot produced by `astrion-dq snapshot`. Upload drift uses the baseline CSVs you provide in `Upload & Analyze`. Without a baseline reference, no drift issue can be produced.
 
 **7. No persistent user accounts or roles**
 Authentication is a single shared Bearer token. There is no per-user access control, audit trail of who made which API call, or role-based permissions.
@@ -493,7 +523,7 @@ This project is Capstone 7 for a data engineering / AI course (Dr. William So, S
 
 > *Does adding SQL cross-validation (Strategy B) and statistical drift detection (Strategy C) to a rule-based data quality pipeline meaningfully improve F1 score, and at what cost in wall-clock time?*
 
-The answer from the evaluation: all three strategies reach the same F1 (0.857) on the current synthetic dataset, with Strategy C being paradoxically fastest (9s vs 15s for A) because drift detection short-circuits some redundant checks. The more interesting finding is that precision = 1.0 across all strategies — zero false positives — which suggests the detection thresholds are well-calibrated for this type of retail data.
+The repo includes an evaluation harness for measuring precision, recall, F1, noise rate, and wall-clock time across Strategies A, B, and C. Run `astrion-dq evaluate` and inspect the `Strategy Comparison` tab for the current numbers on your local dataset and thresholds.
 
 ---
 
@@ -501,7 +531,7 @@ The answer from the evaluation: all three strategies reach the same F1 (0.857) o
 
 Pull requests are welcome. Please:
 
-1. Run `pytest tests/` — all 112 tests must pass
+1. Run `pytest tests/` — all 116 tests must pass
 2. Run `ruff check src/` — zero lint errors
 3. Add tests for any new detection logic or API endpoints
 4. Keep `config.py` as the single source of truth for all thresholds — do not hardcode numbers in detector or ranker code

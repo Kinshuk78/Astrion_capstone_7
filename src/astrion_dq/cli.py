@@ -228,7 +228,9 @@ def dashboard(
     _setup_logging(verbose)
     import subprocess
 
-    dashboard_path = Path(__file__).resolve().parents[3] / "dashboard" / "app.py"
+    from astrion_dq.config import PROJECT_ROOT
+
+    dashboard_path = PROJECT_ROOT / "dashboard" / "app.py"
     if not dashboard_path.exists():
         typer.echo(f"Dashboard not found at {dashboard_path}", err=True)
         raise typer.Exit(1)

@@ -1,10 +1,12 @@
 """Tests for the upload triage pipeline (_run_upload_triage in dashboard).
 
-The pipeline runs: infer_metadata → run_all_checks_parallel → ranking_agent_v2
-on arbitrary DataFrames without using the DuckDB singleton. These tests verify:
+The pipeline runs: infer_metadata -> run_all_checks_parallel -> optional
+    detect_drift -> IssueVerifier -> ranking_agent_v2 on arbitrary DataFrames.
+These tests verify:
   - Clean data produces zero issues
   - Injected nulls produce a missing_values issue
   - Duplicate rows produce a duplicate_rows issue
+  - Baseline uploads can produce statistical_drift issues
   - Results are sorted descending by impact_score
   - dim_table/dim_pk flow through to the output dicts
 """
@@ -12,12 +14,15 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
+import duckdb
 import numpy as np
 import pandas as pd
 import pytest
 
 from astrion_dq.checks.detect import infer_metadata, run_all_checks_parallel
-from astrion_dq.config import REPORT_MAPPING
+from astrion_dq.checks.drift import build_snapshot, detect_drift
+from astrion_dq.config import DUCKDB_SCHEMA, REPORT_MAPPING
+from astrion_dq.graph.debugger import IssueVerifier
 from astrion_dq.models import RankedIssue
 from astrion_dq.ranking.impact import ranking_agent_v2
 
@@ -26,11 +31,31 @@ from astrion_dq.ranking.impact import ranking_agent_v2
 # Helper: minimal triage without needing the Streamlit dashboard
 # ---------------------------------------------------------------------------
 
-def run_triage_on_tables(tables: dict[str, pd.DataFrame]) -> list[dict]:
+def run_triage_on_tables(
+    tables: dict[str, pd.DataFrame],
+    baseline_tables: dict[str, pd.DataFrame] | None = None,
+) -> list[dict]:
     """Replicates _run_upload_triage logic without importing Streamlit."""
     meta = infer_metadata(tables)
     issues = run_all_checks_parallel(tables, meta, sensitivity="high")
+    if baseline_tables:
+        issues += detect_drift(
+            tables,
+            meta,
+            reference_snapshot=build_snapshot(baseline_tables),
+        )
     table_sizes = {name: len(df) for name, df in tables.items()}
+
+    conn = duckdb.connect()
+    conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{DUCKDB_SCHEMA}"')
+    for name, df in tables.items():
+        conn.register("_tmp_upload", df)
+        conn.execute(
+            f'CREATE OR REPLACE TABLE "{DUCKDB_SCHEMA}"."{name}" AS SELECT * FROM _tmp_upload'
+        )
+        conn.unregister("_tmp_upload")
+
+    verified = IssueVerifier(sensitivity="high", connection=conn).verify_all(issues)
     ranked_input = [
         RankedIssue(
             issue_id=i.issue_id,
@@ -44,13 +69,14 @@ def run_triage_on_tables(tables: dict[str, pd.DataFrame]) -> list[dict]:
             impact_score=0.0,
             affected_reports=REPORT_MAPPING.get(i.issue_type, []),
             agent_trace=[],
-            confidence=1.0,
+            confidence=i.confidence,
             dim_table=i.dim_table,
             dim_pk=i.dim_pk,
         )
-        for i in issues
+        for i in verified
     ]
     ranked, _ = ranking_agent_v2(ranked_input, table_sizes)
+    conn.close()
     return [asdict(r) for r in ranked]
 
 
@@ -150,3 +176,24 @@ def test_multiple_tables_all_analysed():
     tables_seen = {r["table"] for r in result}
     # At least table_b's nulls should appear
     assert "table_b" in tables_seen
+
+
+def test_baseline_upload_can_surface_drift():
+    baseline = {
+        "fact_sales": pd.DataFrame({
+            "sales_sk": range(1, 101),
+            "amount": [10.0] * 100,
+        })
+    }
+    current = {
+        "fact_sales": pd.DataFrame({
+            "sales_sk": range(1, 101),
+            "amount": [100.0] * 100,
+        })
+    }
+
+    result = run_triage_on_tables(current, baseline_tables=baseline)
+    issue_types = [r["issue_type"] for r in result]
+    assert "statistical_drift" in issue_types, (
+        "Providing a baseline upload should allow drift detection to contribute issues"
+    )

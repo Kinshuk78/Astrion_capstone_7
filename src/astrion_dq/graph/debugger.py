@@ -53,12 +53,20 @@ class IssueVerifier:
     and receives ``SQL_FALLBACK_CONFIDENCE`` to avoid aborting the run.
     """
 
-    def __init__(self, schema: str = DUCKDB_SCHEMA, sensitivity: str = "normal") -> None:
+    def __init__(
+        self,
+        schema: str = DUCKDB_SCHEMA,
+        sensitivity: str = "normal",
+        connection: duckdb.DuckDBPyConnection | None = None,
+    ) -> None:
         self.schema = schema
         self.sensitivity = sensitivity
+        self._connection = connection
 
     @property
     def _conn(self) -> duckdb.DuckDBPyConnection:
+        if self._connection is not None:
+            return self._connection
         return get_connection()
 
     def _fqt(self, table: str) -> str:

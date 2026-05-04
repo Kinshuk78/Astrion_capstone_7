@@ -8,7 +8,10 @@ venv/
 
 # Environment -- never commit real keys
 .env
-config/.env
+.env.*
+config/.env*
+!.env.example
+!config/.env.example
 
 # Databases
 *.db

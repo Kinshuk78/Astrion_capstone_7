@@ -74,13 +74,12 @@ def _direction(reference: np.ndarray, current: np.ndarray) -> str:
 # Snapshot management
 # ---------------------------------------------------------------------------
 
-def save_snapshot(tables: Dict[str, pd.DataFrame], tag: str = "baseline") -> Path:
-    """Persist column-level distribution statistics as a JSON snapshot.
+def build_snapshot(tables: Dict[str, pd.DataFrame]) -> dict:
+    """Build an in-memory drift snapshot from DataFrames.
 
-    Stores mean, std, percentiles, and histogram bins for numeric columns;
-    top-value fractions for categorical columns. Raw row data is never stored.
+    The shape matches the JSON persisted by ``save_snapshot`` so callers can
+    reuse the same snapshot-style drift path without writing temporary files.
     """
-    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     snapshot: dict = {}
 
     for table, df in tables.items():
@@ -112,6 +111,17 @@ def save_snapshot(tables: Dict[str, pd.DataFrame], tag: str = "baseline") -> Pat
                 counts = series.value_counts(normalize=True).head(50).to_dict()
                 entry["top_value_fracs"] = {str(k): float(v) for k, v in counts.items()}
             snapshot[table][col] = entry
+    return snapshot
+
+
+def save_snapshot(tables: Dict[str, pd.DataFrame], tag: str = "baseline") -> Path:
+    """Persist column-level distribution statistics as a JSON snapshot.
+
+    Stores mean, std, percentiles, and histogram bins for numeric columns;
+    top-value fractions for categorical columns. Raw row data is never stored.
+    """
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot = build_snapshot(tables)
 
     path = SNAPSHOTS_DIR / f"snapshot_{tag}.json"
     path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -135,6 +145,7 @@ def detect_drift(
     current_tables: Dict[str, pd.DataFrame],
     meta: Dict[str, TableMeta],
     reference_tables: Optional[Dict[str, pd.DataFrame]] = None,
+    reference_snapshot: Optional[dict] = None,
     snapshot_tag: str = "baseline",
 ) -> List[QualityIssue]:
     """Detect statistical drift in numeric columns using PSI and the KS test.
@@ -155,15 +166,20 @@ def detect_drift(
         meta: TableMeta mapping produced by ``infer_metadata``. Used to gate
             drift scanning to genuine numeric columns only.
         reference_tables: Optional baseline DataFrames. If None, a saved
-            snapshot identified by *snapshot_tag* is used instead.
+            snapshot identified by *snapshot_tag* is used instead unless
+            *reference_snapshot* is provided.
+        reference_snapshot: Optional in-memory snapshot in the same structure
+            produced by ``save_snapshot`` / ``build_snapshot``. When present,
+            this takes precedence over *reference_tables* so callers can reuse
+            the same snapshot-style drift path as CLI triage without writing to disk.
         snapshot_tag: Tag for the snapshot file (default "baseline").
 
     Returns:
         List of QualityIssue objects with issue_type="statistical_drift".
         Stable columns produce no issues.
     """
-    snapshot: Optional[dict] = None
-    if reference_tables is None:
+    snapshot: Optional[dict] = reference_snapshot
+    if snapshot is None and reference_tables is None:
         snapshot = load_snapshot(snapshot_tag)
         if snapshot is None:
             logger.warning(
@@ -198,12 +214,7 @@ def detect_drift(
             cur_arr = cur_series.to_numpy(dtype=float)
 
             # Resolve reference array
-            if reference_tables is not None:
-                if table not in reference_tables or col not in reference_tables[table].columns:
-                    continue
-                ref_arr = reference_tables[table][col].dropna().to_numpy(dtype=float)
-            else:
-                assert snapshot is not None
+            if snapshot is not None:
                 if table not in snapshot or col not in snapshot[table]:
                     continue
                 snap_col = snapshot[table][col]
@@ -232,6 +243,12 @@ def detect_drift(
                         continue
                 else:
                     continue
+            elif reference_tables is not None:
+                if table not in reference_tables or col not in reference_tables[table].columns:
+                    continue
+                ref_arr = reference_tables[table][col].dropna().to_numpy(dtype=float)
+            else:
+                continue
 
             if len(ref_arr) < 10:
                 continue

@@ -8,6 +8,8 @@ clean message, no traceback.
 """
 from __future__ import annotations
 
+import subprocess
+
 from typer.testing import CliRunner
 
 from astrion_dq.cli import app
@@ -49,3 +51,21 @@ def test_triage_accepts_valid_source_clean():
 def test_triage_accepts_valid_sensitivity():
     result = runner.invoke(app, ["triage", "--sensitivity", "high", "--help"])
     assert result.exit_code == 0
+
+
+def test_dashboard_command_uses_repo_dashboard_path(monkeypatch):
+    calls = []
+
+    def _fake_run(cmd, check):
+        calls.append((cmd, check))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    result = runner.invoke(app, ["dashboard", "--port", "9999"])
+    assert result.exit_code == 0
+    assert "Launching dashboard on http://localhost:9999" in result.output
+    assert calls, "dashboard command must attempt to launch Streamlit"
+    cmd, check = calls[0]
+    assert check is True
+    assert "dashboard/app.py" in " ".join(str(part) for part in cmd)

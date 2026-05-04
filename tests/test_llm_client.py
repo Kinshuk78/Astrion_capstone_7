@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from astrion_dq.llm.client import LLMUnavailable, chat, reset_client
+from astrion_dq.llm.client import LLMUnavailable, chat, chat_with_history, reset_client
 
 
 @pytest.fixture(autouse=True)
@@ -92,3 +92,41 @@ def test_summariser_node_graceful_without_api_key(monkeypatch):
     assert "missing_values" in result["report_md"]
     # No executive summary section without API key
     assert "Executive Summary" not in result["report_md"]
+
+
+def test_chat_with_history_retries_on_openrouter_budget_error(monkeypatch):
+    """A 402 budget error should trigger one retry with a lower max_tokens."""
+    monkeypatch.setattr("astrion_dq.config.OPENROUTER_API_KEY", "sk-or-test-key")
+
+    fake_message = MagicMock()
+    fake_message.content = "retry success"
+    fake_choice = MagicMock()
+    fake_choice.message = fake_message
+    fake_response = MagicMock()
+    fake_response.choices = [fake_choice]
+
+    calls = []
+
+    def _create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Error code: 402 - {'error': {'message': 'This request requires more credits, "
+                "or fewer max_tokens. You requested up to 1200 tokens, but can only afford 1109.'}}"
+            )
+        return fake_response
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = _create
+
+    with patch("astrion_dq.llm.client._client", fake_client):
+        result = chat_with_history(
+            [{"role": "user", "content": "help me"}],
+            system="You are helpful",
+            max_tokens=1200,
+        )
+
+    assert result == "retry success"
+    assert len(calls) == 2
+    assert calls[0]["max_tokens"] == 1200
+    assert calls[1]["max_tokens"] < 1200

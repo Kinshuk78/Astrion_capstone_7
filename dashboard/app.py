@@ -135,37 +135,66 @@ def run_cli(cmd: list) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Retail session DB helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_retail_live_connection(source: str) -> Optional[duckdb.DuckDBPyConnection]:
+    """Load the selected retail dataset into this Streamlit process.
+
+    Sidebar pipeline buttons run CLI subprocesses, so their DuckDB singleton
+    lives in a different process. The SQL Assistant needs a connection inside
+    the Streamlit process, so we lazily materialise the selected retail source
+    here when needed.
+    """
+    try:
+        from astrion_dq.warehouse.loader import load_retail_tables, load_tables_to_duckdb
+
+        tables = load_retail_tables(source=source)
+        conn = load_tables_to_duckdb(tables)
+        st.session_state["_retail_conn_source"] = source
+        return conn
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # SQL Agent helpers
 # ---------------------------------------------------------------------------
 
 def _get_schema_context() -> tuple[Optional[duckdb.DuckDBPyConnection], str]:
     """Return (connection, schema_description) from whatever is loaded.
 
-    Priority: retail DuckDB singleton → upload DuckDB (session_state) → None.
+    Priority: upload DuckDB (session_state) → retail DuckDB singleton /
+    lazily-loaded selected retail dataset → None.
     """
     conn = None
     schema_lines = []
+    source = None
 
-    # Try retail singleton
-    try:
-        from astrion_dq.warehouse.loader import get_connection
-        conn = get_connection()
-        source = "retail"
-    except Exception:
-        conn = None
-        source = None
+    # Prefer uploaded data when present; Upload & Analyze explicitly advertises
+    # that the SQL Assistant connects to the uploaded dataset.
+    upload_conn = st.session_state.get("_upload_conn")
+    if upload_conn is not None:
+        try:
+            upload_conn.execute("SELECT 1")  # test connection still alive
+            conn = upload_conn
+            source = "upload"
+        except Exception:
+            st.session_state.pop("_upload_conn", None)
+            conn = None
 
-    # Fall back to upload connection
     if conn is None:
-        upload_conn = st.session_state.get("_upload_conn")
-        if upload_conn is not None:
-            try:
-                upload_conn.execute("SELECT 1")  # test connection still alive
-                conn = upload_conn
-                source = "upload"
-            except Exception:
-                st.session_state.pop("_upload_conn", None)
-                conn = None
+        desired_source = st.session_state.get("src", "injected")
+        try:
+            from astrion_dq.warehouse.loader import get_connection
+
+            conn = get_connection()
+            if st.session_state.get("_retail_conn_source") != desired_source:
+                conn = _ensure_retail_live_connection(desired_source)
+            source = "retail" if conn is not None else None
+        except Exception:
+            conn = _ensure_retail_live_connection(desired_source)
+            source = "retail" if conn is not None else None
 
     if conn is None:
         return None, ""
@@ -269,6 +298,13 @@ def _sql_agent_respond(user_message: str) -> str:
             "The rest of the dashboard (triage, evaluation, reports) works without it."
         )
     except Exception as exc:
+        if "402" in str(exc) and ("credits" in str(exc).lower() or "can only afford" in str(exc).lower()):
+            return (
+                f"**LLM call failed**: {exc}\n\n"
+                "OpenRouter accepted the API key but rejected the request because the "
+                "remaining credit/token budget is too low for this response. "
+                "Add credits or ask a shorter question."
+            )
         return f"**LLM call failed**: {exc}\n\nCheck your API key and network connection."
 
 
@@ -296,29 +332,52 @@ def _execute_sql_blocks(response: str, conn: duckdb.DuckDBPyConnection) -> list[
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def _run_upload_triage(tables: dict[str, pd.DataFrame]) -> list[dict]:
-    """Run profiler → detector → ranker on arbitrary DataFrames.
+def _run_upload_triage(
+    tables: dict[str, pd.DataFrame],
+    baseline_tables: dict[str, pd.DataFrame] | None = None,
+) -> list[dict]:
+    """Run a verified upload triage on arbitrary DataFrames.
+
+    Flow:
+      profiler -> detector -> [optional drift] -> debugger(SQL cross-validation) -> ranker
 
     Decorated with @st.cache_data so results survive browser refreshes within
     the same Streamlit server process. Streamlit hashes DataFrames using their
     content, so re-uploading identical files reuses the cached result.
 
-    Does NOT use DuckDB singleton (avoids polluting the retail connection).
-    Uses pandas-based detection only (no SQL cross-validation step).
-    Always uses high sensitivity.
-    Returns list of ranked issue dicts.
+    Drift detection runs only when *baseline_tables* is provided. This keeps
+    ad hoc single-dataset uploads reliable while still enabling full workflow
+    comparisons when the user supplies a trusted baseline upload.
+    Returns ranked issue dicts with confidence scores preserved from the
+    verifier so low-confidence issues can be reviewed in the UI.
     """
     from dataclasses import asdict
 
     from astrion_dq.checks.detect import infer_metadata, run_all_checks_parallel
+    from astrion_dq.checks.drift import build_snapshot, detect_drift
     from astrion_dq.config import REPORT_MAPPING
+    from astrion_dq.graph.debugger import IssueVerifier
     from astrion_dq.models import RankedIssue
     from astrion_dq.ranking.impact import ranking_agent_v2
 
     meta = infer_metadata(tables)
     issues = run_all_checks_parallel(tables, meta, sensitivity="high")
-
+    if baseline_tables:
+        # Use the same snapshot-style drift path as CLI triage so uploaded
+        # baseline comparisons and saved-snapshot comparisons produce
+        # consistent signals.
+        issues += detect_drift(
+            tables,
+            meta,
+            reference_snapshot=build_snapshot(baseline_tables),
+        )
     table_sizes = {name: len(df) for name, df in tables.items()}
+    conn = _build_upload_conn(tables)
+
+    try:
+        verified = IssueVerifier(sensitivity="high", connection=conn).verify_all(issues)
+    finally:
+        conn.close()
 
     ranked_input = [
         RankedIssue(
@@ -333,9 +392,11 @@ def _run_upload_triage(tables: dict[str, pd.DataFrame]) -> list[dict]:
             impact_score=0.0,
             affected_reports=REPORT_MAPPING.get(i.issue_type, []),
             agent_trace=[],
-            confidence=1.0,
+            confidence=i.confidence,
+            dim_table=i.dim_table,
+            dim_pk=i.dim_pk,
         )
-        for i in issues
+        for i in verified
     ]
 
     ranked, _ = ranking_agent_v2(ranked_input, table_sizes)
@@ -343,13 +404,56 @@ def _run_upload_triage(tables: dict[str, pd.DataFrame]) -> list[dict]:
 
 
 def _build_upload_conn(tables: dict[str, pd.DataFrame]) -> duckdb.DuckDBPyConnection:
-    """Load uploaded DataFrames into a fresh in-memory DuckDB for the SQL Agent."""
+    """Load uploaded DataFrames into a fresh in-memory DuckDB.
+
+    Tables are written under the standard ``dq_retail`` schema so the shared
+    IssueVerifier can run unchanged, and mirrored as top-level views so the
+    SQL Assistant can still reference simple table names when needed.
+    """
+    from astrion_dq.config import DUCKDB_SCHEMA
+
     conn = duckdb.connect()
+    conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{DUCKDB_SCHEMA}"')
     for name, df in tables.items():
         conn.register("_tmp_upload", df)
-        conn.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM _tmp_upload')
+        conn.execute(
+            f'CREATE OR REPLACE TABLE "{DUCKDB_SCHEMA}"."{name}" AS SELECT * FROM _tmp_upload'
+        )
+        conn.execute(
+            f'CREATE OR REPLACE VIEW "{name}" AS SELECT * FROM "{DUCKDB_SCHEMA}"."{name}"'
+        )
         conn.unregister("_tmp_upload")
     return conn
+
+
+def _load_uploaded_tables(uploaded_files) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Parse uploaded CSVs into table-name -> DataFrame plus any load warnings."""
+    tables: dict[str, pd.DataFrame] = {}
+    load_errors: list[str] = []
+
+    for f in uploaded_files:
+        raw_name = Path(f.name).stem.lower().replace(" ", "_").replace("-", "_")
+        table_name = re.sub(r"[^\w]", "_", raw_name)
+
+        try:
+            try:
+                df = pd.read_csv(f)
+            except UnicodeDecodeError:
+                f.seek(0)
+                df = pd.read_csv(f, encoding="latin-1")
+
+            if df.empty:
+                load_errors.append(f"`{f.name}` is empty — skipped.")
+                continue
+            if df.shape[1] == 0:
+                load_errors.append(f"`{f.name}` has no columns — skipped.")
+                continue
+
+            tables[table_name] = df
+        except Exception as exc:
+            load_errors.append(f"`{f.name}` failed to load: {exc}")
+
+    return tables, load_errors
 
 
 def _generate_upload_report(ranked: list[dict]) -> str:
@@ -376,6 +480,28 @@ def _generate_upload_report(ranked: list[dict]) -> str:
             lines += _resolution_advice(issue, rank)
 
     return "\n".join(lines)
+
+
+def _close_upload_conn() -> None:
+    """Close the uploaded-data DuckDB connection when it exists."""
+    conn = st.session_state.pop("_upload_conn", None)
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _reset_upload_session() -> None:
+    """Clear uploaded files, upload results, and SQL Assistant upload context."""
+    _close_upload_conn()
+    for key in ("_upload_results", "_upload_report_md"):
+        st.session_state.pop(key, None)
+    st.session_state.pop("_agent_messages", None)
+    st.session_state["_upload_uploader_version"] = (
+        st.session_state.get("_upload_uploader_version", 0) + 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +546,7 @@ with st.sidebar:
             ok, out = run_cli(["triage", "--source", data_source, "--sensitivity", "high"])
         st.session_state["_running"] = False
         if ok:
+            _ensure_retail_live_connection(data_source)
             st.success("Triage complete.")
             st.cache_data.clear()
         else:
@@ -843,51 +970,63 @@ with tab_sql:
 with tab_upload:
     st.header("Upload & Analyze")
     st.caption(
-        "Upload your own CSV files. The system runs a full triage automatically — "
-        "no manual injection step needed. Each file becomes one table. "
-        "Results show in the same format as the retail triage and the SQL Assistant "
-        "connects to the uploaded data."
+        "Upload your own CSV files. The default path runs a verified analysis: "
+        "profiler -> detector -> SQL cross-validation -> ranker. "
+        "Each file becomes one table, and the SQL Assistant connects to the uploaded data."
+    )
+    st.caption(
+        "You can also enable drift detection by uploading a matching baseline dataset. "
+        "Without a baseline upload, the workflow skips drift and runs the verified path only."
     )
 
+    uploader_version = st.session_state.setdefault("_upload_uploader_version", 0)
+    reset_col, help_col = st.columns([1, 2])
+    with reset_col:
+        if st.button("Clear Uploaded Files", key="clear_upload_session", use_container_width=True):
+            _reset_upload_session()
+            st.rerun()
+    with help_col:
+        st.caption(
+            "Use this if you uploaded the wrong file or need to reset an oversize upload. "
+            "It clears the uploader, upload results, and uploaded SQL Assistant context."
+        )
+
     uploaded_files = st.file_uploader(
-        "Drop CSV files here (one file = one table, filename = table name)",
+        "Current dataset CSVs (one file = one table, filename = table name)",
         type=["csv"],
         accept_multiple_files=True,
-        key="csv_uploader",
+        key=f"csv_uploader_{uploader_version}",
     )
+
+    enable_upload_drift = st.toggle(
+        "Enable drift detection using a baseline upload",
+        key="enable_upload_drift",
+        help="Upload a second dataset with matching table and column names to compare "
+             "the current upload against a trusted baseline.",
+    )
+
+    baseline_files = []
+    if enable_upload_drift:
+        baseline_files = st.file_uploader(
+            "Baseline dataset CSVs for drift comparison",
+            type=["csv"],
+            accept_multiple_files=True,
+            key=f"csv_baseline_uploader_{uploader_version}",
+        )
 
     if uploaded_files:
         # ── Load and validate ──────────────────────────────────────────────
-        tables: dict[str, pd.DataFrame] = {}
-        load_errors: list[str] = []
+        tables, load_errors = _load_uploaded_tables(uploaded_files)
+        baseline_tables: dict[str, pd.DataFrame] = {}
+        baseline_errors: list[str] = []
 
-        for f in uploaded_files:
-            raw_name = Path(f.name).stem.lower().replace(" ", "_").replace("-", "_")
-            # Guard: strip non-alphanumeric (keep underscores)
-            table_name = re.sub(r"[^\w]", "_", raw_name)
-
-            try:
-                # Try UTF-8, fall back to latin-1
-                try:
-                    df = pd.read_csv(f)
-                except UnicodeDecodeError:
-                    f.seek(0)
-                    df = pd.read_csv(f, encoding="latin-1")
-
-                if df.empty:
-                    load_errors.append(f"`{f.name}` is empty — skipped.")
-                    continue
-                if df.shape[1] == 0:
-                    load_errors.append(f"`{f.name}` has no columns — skipped.")
-                    continue
-
-                tables[table_name] = df
-
-            except Exception as exc:
-                load_errors.append(f"`{f.name}` failed to load: {exc}")
+        if enable_upload_drift and baseline_files:
+            baseline_tables, baseline_errors = _load_uploaded_tables(baseline_files)
 
         for err in load_errors:
             st.warning(err)
+        for err in baseline_errors:
+            st.warning(f"Baseline: {err}")
 
         if not tables:
             st.error("No valid CSV files loaded. Check the warnings above.")
@@ -900,16 +1039,53 @@ with tab_upload:
 
             st.divider()
 
+            baseline_ready = bool(baseline_tables)
+            drift_enabled = enable_upload_drift and baseline_ready
+
+            if enable_upload_drift and not baseline_ready:
+                st.info(
+                    "Upload baseline CSVs to enable drift detection. "
+                    "Otherwise the analysis will run without drift."
+                )
+            elif drift_enabled:
+                matching_tables = sorted(set(tables) & set(baseline_tables))
+                st.success(
+                    f"Drift detection enabled across {len(matching_tables)} matching table(s): "
+                    f"{', '.join(matching_tables) if matching_tables else 'none'}."
+                )
+                if not matching_tables:
+                    st.warning(
+                        "No table names match between current and baseline uploads, so drift "
+                        "checks will not produce signals until names align."
+                    )
+
             # ── Run Analysis button ───────────────────────────────────────
-            if st.button("Run Analysis", type="primary", key="run_upload_triage"):
-                with st.spinner("Running data quality checks on uploaded data..."):
+            run_label = "Run Full Verified Analysis" if drift_enabled else "Run Verified Analysis"
+            spinner_label = (
+                "Running verified data quality + drift checks on uploaded data..."
+                if drift_enabled else
+                "Running verified data quality checks on uploaded data..."
+            )
+            if st.button(run_label, type="primary", key="run_upload_triage"):
+                with st.spinner(spinner_label):
                     try:
-                        ranked = _run_upload_triage(tables)
+                        ranked = _run_upload_triage(
+                            tables,
+                            baseline_tables=baseline_tables if drift_enabled else None,
+                        )
                         st.session_state["_upload_results"] = ranked
                         # Build DuckDB connection for SQL Agent
+                        _close_upload_conn()
                         st.session_state["_upload_conn"] = _build_upload_conn(tables)
                         st.session_state["_upload_report_md"] = _generate_upload_report(ranked)
-                        st.success(f"Analysis complete — {len(ranked)} issue(s) found.")
+                        if drift_enabled:
+                            st.success(
+                                f"Full verified analysis complete — {len(ranked)} issue(s) found."
+                            )
+                        else:
+                            st.success(
+                                f"Verified analysis complete — {len(ranked)} issue(s) found."
+                            )
                     except Exception as exc:
                         st.error(f"Analysis failed: {exc}")
 
@@ -922,16 +1098,30 @@ with tab_upload:
                     st.success("No data quality issues detected in the uploaded files.")
                 else:
                     # Metrics row
+                    from astrion_dq.config import CONFIDENCE_THRESHOLD
+
                     total = len(ranked)
                     high_c = sum(1 for r in ranked if r.get("severity") == "high")
                     med_c = sum(1 for r in ranked if r.get("severity") == "medium")
                     avg_bis = sum(r.get("impact_score", 0) for r in ranked) / max(total, 1)
+                    avg_conf = sum(r.get("confidence", 1.0) for r in ranked) / max(total, 1)
+                    needs_review = sum(
+                        1 for r in ranked
+                        if r.get("confidence", 1.0) < CONFIDENCE_THRESHOLD
+                    )
 
-                    m1, m2, m3, m4 = st.columns(4)
+                    m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Total Issues", total)
                     m2.metric("HIGH", high_c)
                     m3.metric("MEDIUM", med_c)
                     m4.metric("Avg BIS", f"{avg_bis:.4f}")
+                    m5.metric("Avg Confidence", f"{avg_conf:.2f}")
+
+                    if needs_review:
+                        st.warning(
+                            f"{needs_review} issue(s) have confidence below "
+                            f"{CONFIDENCE_THRESHOLD:.2f} and should be reviewed manually."
+                        )
 
                     # Issues table
                     rows_out = []
@@ -944,6 +1134,7 @@ with tab_upload:
                             "Columns": ", ".join(r.get("columns") or []) or "n/a",
                             "Severity": r.get("severity", "").upper(),
                             "BIS": round(r.get("impact_score", 0.0), 4),
+                            "Confidence": round(r.get("confidence", 1.0), 2),
                             "Evidence Rows": r.get("evidence_rows", 0),
                             "Description": r.get("description", ""),
                         })
