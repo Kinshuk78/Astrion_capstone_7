@@ -115,7 +115,7 @@ That gives you:
 - ranked injected issues in `Triage Issues`
 - the markdown report in `Markdown Report`
 - A/B/C workflow comparison in `Strategy Comparison`
-- the SQL Assistant if `OPENROUTER_API_KEY` is configured
+- the SQL Assistant if `OPENROUTER_API_KEY` is configured locally, or if `ASTRION_API_URL` points at a deployed API that holds the key
 
 ---
 
@@ -270,7 +270,7 @@ The dashboard has 7 tabs:
 | **Markdown Report** | The full triage report with SQL fix code |
 | **Run History** | Every previous triage run with timestamps |
 | **Architecture** | Diagram of the pipeline and how it works |
-| **SQL Assistant** | Chat with an LLM that knows the currently loaded retail or uploaded dataset. It can explain issues, write DuckDB SQL, and auto-executes SQL blocks inline. Requires `OPENROUTER_API_KEY`. |
+| **SQL Assistant** | Chat with an LLM that knows the currently loaded retail or uploaded dataset. It can explain issues, write DuckDB SQL, and auto-executes SQL blocks inline. For Streamlit Cloud, point `ASTRION_API_URL` at a Render API that holds `OPENROUTER_API_KEY`. |
 | **Upload & Analyze** | Upload your own CSVs and run a verified workflow: `profiler -> detector -> SQL cross-validation -> ranker`. If you also upload a baseline dataset, it adds snapshot-style drift detection so uploaded runs align with retail CLI drift behavior. |
 
 Notes:
@@ -282,7 +282,7 @@ Notes:
 Use these values in the Streamlit Community Cloud deploy form:
 
 - **Repository**: `Kinshuk78/Astrion_capstone_7`
-- **Branch**: `main`
+- **Branch**: `streamlit-cloud-deploy`
 - **Main file path**: `dashboard/app.py`
 - **Python version**: `3.11`
 
@@ -291,11 +291,13 @@ Important:
 - Community Cloud executes `streamlit run` from the repository root, which matches this repo layout.
 - The retail demo needs `data/raw/retail/fact_sales_normalized.csv` to be committed to GitHub.
 - If that file is missing from the deployed branch, the app can start but the retail workflow will be incomplete.
+- For AI features, keep `OPENROUTER_API_KEY` only on the Render API service. The Streamlit Cloud app should call that API via `ASTRION_API_URL` instead of storing the LLM key itself.
 
 Optional secrets:
 
-- `OPENROUTER_API_KEY` to enable the SQL Assistant and LLM summaries
-- `ASTRION_API_TOKEN` to enable the dashboard login gate
+- `ASTRION_API_URL` pointing at your Render API, for example `https://astrion-dq-api.onrender.com`
+- `ASTRION_API_TOKEN` only if your Render API requires a Bearer token
+- `ASTRION_DASHBOARD_TOKEN` only if you want a separate login prompt on the Streamlit UI
 
 You can paste these into Community Cloud's **Advanced settings → Secrets** using
 [.streamlit/secrets.toml.example](/Users/kinshuk/Desktop/Astrion_capstone_7/.streamlit/secrets.toml.example:1)
@@ -307,7 +309,7 @@ Deployment flow:
 2. Open `https://share.streamlit.io/`.
 3. Click `Create app`.
 4. Select this repository and set the main file to `dashboard/app.py`.
-5. In `Advanced settings`, choose Python `3.11` and optionally paste your secrets.
+5. In `Advanced settings`, choose Python `3.11` and paste `ASTRION_API_URL`.
 6. Click `Deploy`.
 
 ---
@@ -406,9 +408,9 @@ Render.com can host both the dashboard and the API for free. The `render.yaml` f
 2. Go to [dashboard.render.com](https://dashboard.render.com) → **New** → **Blueprint**
 3. Connect your GitHub repo — Render detects `render.yaml` automatically
 4. Click **Apply** — it creates two services: `astrion-dq-api` and `astrion-dq-dashboard`
-5. In the Render dashboard, set these secret environment variables for both services:
-   - `OPENROUTER_API_KEY` — your OpenRouter key (optional but recommended)
-   - `ASTRION_API_TOKEN` — any password you choose, or leave blank for open access
+5. In the Render dashboard, set these secret environment variables:
+   - On `astrion-dq-api`: `OPENROUTER_API_KEY` and optionally `ASTRION_API_TOKEN`
+   - On `astrion-dq-dashboard`: optionally `ASTRION_API_TOKEN` if the API is protected
 6. Wait ~3 minutes for the build to finish
 
 Your live URLs will be:
@@ -426,9 +428,11 @@ For GitHub / Render / Docker deployment, prefer platform-managed secret environm
 
 | Variable | Default | What it does |
 |---|---|---|
-| `OPENROUTER_API_KEY` | (empty) | LLM API key. Without it, AI features are disabled but everything else works. |
+| `OPENROUTER_API_KEY` | (empty) | LLM API key. Keep this on the Render API service or in local `config/.env`. Do not put it in Streamlit Cloud secrets unless you explicitly want the dashboard to call OpenRouter directly. |
 | `OPENROUTER_MODEL` | `anthropic/claude-sonnet-4-6` | Which AI model to use for summaries and the SQL Agent |
-| `ASTRION_API_TOKEN` | (empty) | Password for the API and dashboard. Leave blank for open access. |
+| `ASTRION_API_URL` | (empty) | Base URL for a deployed Astrion API. When set, the dashboard proxies SQL Assistant and AI summaries through that API. |
+| `ASTRION_API_TOKEN` | (empty) | Bearer token used by the dashboard when calling a protected API. |
+| `ASTRION_DASHBOARD_TOKEN` | (empty) | Optional separate login password for the Streamlit UI itself. |
 | `RATE_LIMIT` | `10/minute` | How many API triage requests are allowed per IP per minute |
 | `DETECTION_SENSITIVITY` | `high` | `high` = catch more issues (tighter thresholds). `normal` = fewer, more certain catches. |
 | `LOG_LEVEL` | `INFO` | Set to `DEBUG` to see detailed pipeline logs |

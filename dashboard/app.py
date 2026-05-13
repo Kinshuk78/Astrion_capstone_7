@@ -20,8 +20,10 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import altair as alt
 import duckdb
@@ -44,12 +46,97 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def _get_setting(name: str, default: str = "") -> str:
+    """Return an env var or Streamlit secret without hard-failing when absent."""
+    value = os.environ.get(name)
+    if value:
+        return value
+
+    try:
+        secret_value = st.secrets.get(name, "")
+    except Exception:
+        secret_value = ""
+
+    return str(secret_value or default)
+
+
+def _normalise_api_base_url(raw: str) -> str:
+    raw = (raw or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if raw.endswith(".onrender.com") or raw.endswith(".streamlit.app"):
+        return f"https://{raw}"
+    return f"http://{raw}"
+
+
+_API_BASE_URL = _normalise_api_base_url(
+    _get_setting("ASTRION_API_URL") or _get_setting("ASTRION_API_BASE_URL")
+)
+_API_AUTH_TOKEN = _get_setting("ASTRION_API_TOKEN", "")
+_DASHBOARD_TOKEN = _get_setting("ASTRION_DASHBOARD_TOKEN", "")
+
+
+def _api_json_request(
+    path: str,
+    payload: Optional[dict[str, Any]] = None,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Call the configured Render API and parse the JSON response."""
+    if not _API_BASE_URL:
+        raise RuntimeError("ASTRION_API_URL is not configured.")
+
+    url = f"{_API_BASE_URL}{path}"
+    headers = {"Accept": "application/json"}
+    data = None
+    method = "GET"
+
+    if _API_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {_API_AUTH_TOKEN}"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+        method = "POST"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"{exc.code} {exc.reason}: {detail or 'request failed'}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
+
+    if not body:
+        return {}
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Non-JSON response from {url}.") from exc
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_remote_summary(source: str, issues_payload: str) -> dict[str, Any]:
+    """Fetch an LLM summary from the Render API using only ranked issue metadata."""
+    issues = json.loads(issues_payload)
+    try:
+        return _api_json_request(
+            "/assistant/summary",
+            {"source": source, "issues": issues},
+            timeout=90,
+        )
+    except Exception as exc:
+        return {"summary": "", "error": str(exc), "used_fallback": True}
+
 # ---------------------------------------------------------------------------
 # Password gate
-# When ASTRION_API_TOKEN is set the dashboard requires the same token.
-# When the env var is unset the gate is skipped (dev / local mode).
+# Use ASTRION_DASHBOARD_TOKEN for a UI login gate.
+# For backwards compatibility, ASTRION_API_TOKEN still gates local-only runs.
 # ---------------------------------------------------------------------------
-_expected_token = os.environ.get("ASTRION_API_TOKEN", "")
+_expected_token = _DASHBOARD_TOKEN or ("" if _API_BASE_URL else _API_AUTH_TOKEN)
 if _expected_token:
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
@@ -246,10 +333,23 @@ Rules:
 - Be concise but complete; prefer showing working SQL over lengthy prose"""
 
 
+def _trim_agent_history(history: list[dict], budget_chars: int = 24_000) -> list[dict]:
+    """Keep the newest chat turns that fit within the configured char budget."""
+    used_chars = 0
+    trimmed: list[dict] = []
+    for msg in reversed(history):
+        msg_chars = len(msg.get("content", ""))
+        if used_chars + msg_chars > budget_chars:
+            break
+        trimmed.insert(0, msg)
+        used_chars += msg_chars
+    if not trimmed and history:
+        trimmed = [history[-1]]
+    return trimmed
+
+
 def _sql_agent_respond(user_message: str) -> str:
     """Call the LLM with full conversation history and return the reply."""
-    from astrion_dq.llm.client import LLMUnavailable, chat_with_history
-
     conn, schema_desc = _get_schema_context()
 
     # Build issues context from the last ranked_issues file loaded
@@ -267,24 +367,36 @@ def _sql_agent_respond(user_message: str) -> str:
         )
     issues_json = "\n".join(top_issues) if top_issues else "  (no issues loaded yet)"
 
-    system = _build_agent_system_prompt(schema_desc or "  (no database loaded)", issues_json)
-
-    # Trim history by estimated token count (≈4 chars per token).
-    # Budget: 6,000 tokens (24,000 chars) — safe across all OpenRouter models.
-    # Counting from the most recent message backward so the newest context is
-    # always included; oldest messages are dropped first when budget is exceeded.
-    _TOKEN_BUDGET_CHARS = 24_000
     history = st.session_state.get("_agent_messages", [])
-    _used_chars = 0
-    trimmed: list = []
-    for msg in reversed(history):
-        _msg_chars = len(msg.get("content", ""))
-        if _used_chars + _msg_chars > _TOKEN_BUDGET_CHARS:
-            break
-        trimmed.insert(0, msg)
-        _used_chars += _msg_chars
-    if not trimmed and history:
-        trimmed = [history[-1]]  # always keep at least the last message
+    trimmed = _trim_agent_history(history)
+
+    if _API_BASE_URL:
+        try:
+            result = _api_json_request(
+                "/assistant/chat",
+                {
+                    "message": user_message,
+                    "history": [
+                        {"role": msg.get("role", ""), "content": msg.get("content", "")}
+                        for msg in trimmed
+                    ],
+                    "schema_desc": schema_desc or "  (no database loaded)",
+                    "issues": issues[:25],
+                    "max_tokens": 1200,
+                },
+                timeout=90,
+            )
+            response = (result.get("response") or "").strip()
+            return response or "The remote assistant returned an empty response."
+        except Exception as exc:
+            return (
+                f"**Remote assistant call failed**: {exc}\n\n"
+                "Check `ASTRION_API_URL`, `ASTRION_API_TOKEN`, and the Render API deployment."
+            )
+
+    from astrion_dq.llm.client import LLMUnavailable, chat_with_history
+
+    system = _build_agent_system_prompt(schema_desc or "  (no database loaded)", issues_json)
 
     messages = trimmed + [{"role": "user", "content": user_message}]
 
@@ -505,418 +617,351 @@ def _reset_upload_session() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Dashboard presentation helpers
 # ---------------------------------------------------------------------------
 
-with st.sidebar:
-    st.title("Astrion DQ")
-    st.caption("Retail Data Quality Triage")
-    st.divider()
-
-    st.subheader("Pipeline Controls")
-    data_source = st.selectbox("Data source", ["injected", "clean"], key="src")
-    # Sensitivity is always "high" — maximises issue detection.
-    sensitivity = "high"
-
-    _running = st.session_state.get("_running", False)
-
-    if st.button("Inject Issues", use_container_width=True, disabled=_running):
-        st.session_state["_running"] = True
-        with st.spinner("Injecting synthetic issues..."):
-            ok, out = run_cli(["inject"])
-        st.session_state["_running"] = False
-        if ok:
-            st.success("Issues injected.")
-        else:
-            st.error(f"Failed:\n{out[:400]}")
-
-    if st.button("Save Snapshot", use_container_width=True, disabled=_running):
-        st.session_state["_running"] = True
-        with st.spinner("Saving drift snapshot..."):
-            ok, out = run_cli(["snapshot"])
-        st.session_state["_running"] = False
-        if ok:
-            st.success("Snapshot saved.")
-        else:
-            st.error(f"Failed:\n{out[:400]}")
-
-    if st.button("Run Triage", use_container_width=True, type="primary", disabled=_running):
-        st.session_state["_running"] = True
-        with st.spinner(f"Running triage on {data_source!r} (sensitivity=high)..."):
-            ok, out = run_cli(["triage", "--source", data_source, "--sensitivity", "high"])
-        st.session_state["_running"] = False
-        if ok:
-            _ensure_retail_live_connection(data_source)
-            st.success("Triage complete.")
-            st.cache_data.clear()
-        else:
-            st.error(f"Failed:\n{out[:400]}")
-
-    if st.button("Evaluate Strategies", use_container_width=True, disabled=_running):
-        st.session_state["_running"] = True
-        with st.spinner("Evaluating A / B / C strategies..."):
-            ok, out = run_cli(["evaluate", "--source", "injected"])
-        st.session_state["_running"] = False
-        if ok:
-            st.success("Evaluation complete.")
-            st.cache_data.clear()
-        else:
-            st.error(f"Failed:\n{out[:400]}")
-
-    if st.button("Generate PDF Report", use_container_width=True, disabled=_running):
-        st.session_state["_running"] = True
-        with st.spinner("Generating PDF..."):
-            ok, out = run_cli(["report", "--source", data_source])
-        st.session_state["_running"] = False
-        if ok:
-            st.success("PDF report generated.")
-        else:
-            st.error(f"Failed:\n{out[:400]}")
-
-    st.divider()
-    st.caption("v0.6.0 - Astrion Capstone 7")
-
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-
-(
-    tab_triage, tab_compare, tab_report,
-    tab_history, tab_arch, tab_sql, tab_upload,
-) = st.tabs([
-    "Triage Issues",
-    "Strategy Comparison",
-    "Markdown Report",
-    "Run History",
-    "Architecture",
-    "SQL Assistant",
-    "Upload & Analyze",
-])
-
-# ============================================================================
-# TAB 1: TRIAGE ISSUES
-# ============================================================================
-with tab_triage:
-    st.header("Triage Issues")
-
-    issues = load_ranked_issues(data_source)
-
-    if not issues:
-        st.info(
-            "No ranked issues found. Run the pipeline:\n\n"
-            "1. Click **Inject Issues** in the sidebar.\n"
-            "2. Click **Run Triage**."
-        )
-    else:
-        total = len(issues)
-        high_count = sum(1 for i in issues if i.get("severity") == "high")
-        med_count = sum(1 for i in issues if i.get("severity") == "medium")
-        avg_score = sum(i.get("impact_score", 0.0) for i in issues) / max(total, 1)
-        avg_conf = sum(i.get("confidence", 1.0) for i in issues) / max(total, 1)
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Issues", total)
-        c2.metric("HIGH Severity", high_count)
-        c3.metric("MEDIUM Severity", med_count)
-        c4.metric("Avg BIS", f"{avg_score:.4f}")
-        c5.metric("Avg Confidence", f"{avg_conf:.2f}")
-
-        st.divider()
-
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            sev_filter = st.multiselect(
-                "Severity",
-                ["high", "medium", "low"],
-                default=["high", "medium"],
-                key="sev_f",
-            )
-        with col_f2:
-            types_available = sorted({i.get("issue_type", "") for i in issues})
-            type_filter = st.multiselect(
-                "Issue type",
-                types_available,
-                default=[],
-                key="type_f",
-            )
-
-        filtered = [
-            i for i in issues
-            if i.get("severity") in sev_filter
-            and (not type_filter or i.get("issue_type") in type_filter)
-        ]
-
-        st.subheader(f"Issues ({len(filtered)} shown)")
-        if filtered:
-            rows = []
-            for rank, i in enumerate(filtered[:50], start=1):
-                rows.append({
-                    "Rank": rank,
-                    "Issue ID": i.get("issue_id", ""),
-                    "Issue Type": i.get("issue_type", ""),
-                    "Table": i.get("table", ""),
-                    "Columns": ", ".join(i.get("columns") or []) or "n/a",
-                    "Severity": i.get("severity", "low").upper(),
-                    "BIS": round(i.get("impact_score", 0.0), 6),
-                    "Confidence": round(i.get("confidence", 1.0), 2),
-                    "Evidence Rows": i.get("evidence_rows", 0),
-                    "Description": i.get("description", ""),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        st.divider()
-        st.subheader("Issue Distribution")
-        chart_col1, chart_col2 = st.columns(2)
-
-        with chart_col1:
-            st.write("Count by issue type")
-            type_counts: dict = {}
-            for i in issues:
-                t = i.get("issue_type", "unknown")
-                type_counts[t] = type_counts.get(t, 0) + 1
-            if type_counts:
-                df_tc = pd.DataFrame(
-                    list(type_counts.items()), columns=["Issue Type", "Count"]
-                ).sort_values("Count", ascending=False)
-                st.altair_chart(
-                    alt.Chart(df_tc).mark_bar().encode(
-                        x=alt.X("Issue Type:N", sort="-y", title="Issue Type"),
-                        y=alt.Y("Count:Q", title="Count"),
-                        tooltip=["Issue Type", "Count"],
-                    ).properties(height=250),
-                    use_container_width=True,
-                )
-
-        with chart_col2:
-            st.write("Total BIS by table")
-            table_scores: dict = {}
-            for i in issues:
-                t = i.get("table", "unknown")
-                table_scores[t] = table_scores.get(t, 0.0) + i.get("impact_score", 0.0)
-            if table_scores:
-                df_ts = pd.DataFrame(
-                    list(table_scores.items()), columns=["Table", "Total BIS"]
-                ).sort_values("Total BIS", ascending=False)
-                st.altair_chart(
-                    alt.Chart(df_ts).mark_bar().encode(
-                        x=alt.X("Table:N", sort="-y", title="Table"),
-                        y=alt.Y("Total BIS:Q", title="Total BIS"),
-                        tooltip=["Table", "Total BIS"],
-                    ).properties(height=250),
-                    use_container_width=True,
-                )
-
-# ============================================================================
-# TAB 2: STRATEGY COMPARISON
-# ============================================================================
-with tab_compare:
-    st.header("Strategy Comparison")
-    st.caption(
-        "Precision, recall, and noise rate for the three evaluation strategies "
-        "(A Baseline, B Supervisor, C Full) run against injected ground truth."
-    )
-
-    eval_data = load_evaluation()
-
-    if not eval_data:
-        st.info(
-            "No evaluation data found.\n\n"
-            "Run: astrion-dq inject, then astrion-dq evaluate."
-        )
-    else:
-        metric_keys = [
-            ("precision", "Precision"),
-            ("recall", "Recall"),
-            ("f1", "F1"),
-            ("top_5_recall", "Top-5 Recall"),
-            ("noise_rate", "Noise Rate"),
-            ("summary_accuracy", "Summary Accuracy"),
-            ("wall_seconds", "Wall Time (s)"),
-        ]
-
-        by_strategy = {r["strategy"]: r for r in eval_data}
-
-        rows = []
-        for key, label in metric_keys:
-            row: dict = {"Metric": label}
-            for strat_key, col_label in [
-                ("A_baseline", "A Baseline"),
-                ("B_supervisor", "B Supervisor"),
-                ("C_full", "C Full"),
-            ]:
-                val = by_strategy.get(strat_key, {}).get(key)
-                if val is None:
-                    row[col_label] = "n/a"
-                elif isinstance(val, float):
-                    row[col_label] = f"{val:.4f}"
-                else:
-                    row[col_label] = str(val)
-            rows.append(row)
-
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        for r in eval_data:
-            trace = r.get("agent_trace") or []
-            if trace:
-                with st.expander(f"Agent trace: {r.get('strategy', '')}"):
-                    st.code(" -> ".join(trace))
-
-# ============================================================================
-# TAB 3: MARKDOWN REPORT
-# ============================================================================
-with tab_report:
-    st.header("Triage Report")
-
-    report_text = load_report_md(data_source)
-    if report_text is None:
-        st.info(
-            "No triage report found.\n\n"
-            "Run 'astrion-dq triage' to generate one."
-        )
-    else:
-        st.markdown(report_text)
-
-# ============================================================================
-# TAB 4: RUN HISTORY
-# ============================================================================
-with tab_history:
-    st.header("Run History")
-    st.caption("Every triage run appends one record to outputs/run_log.jsonl.")
-
-    if st.button("Refresh", key="refresh_history"):
-        st.cache_data.clear()
-
-    run_entries = load_run_log()
-
-    if not run_entries:
-        st.info("No runs recorded yet. Run 'astrion-dq triage' or POST /triage to create an entry.")
-    else:
-        rows = []
-        for e in run_entries:
-            rows.append({
-                "Run ID": e.get("run_id", ""),
-                "Source": e.get("source", ""),
-                "Sensitivity": e.get("sensitivity", ""),
-                "Timestamp (UTC)": e.get("timestamp", ""),
-                "Issues Ranked": e.get("issue_count", 0),
-                "Agent Trace": " -> ".join(e.get("agent_trace") or []),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption(f"Showing {len(rows)} run(s), most recent first.")
-
-# ============================================================================
-# TAB 5: ARCHITECTURE
-# ============================================================================
-with tab_arch:
-    st.header("System Architecture")
+def _inject_dashboard_styles() -> None:
     st.markdown(
         """
-Astrion DQ is a retail data quality triage system built around a LangGraph
-workflow with deterministic supervisor routing.
+<style>
+    .block-container {
+        padding-top: 1.6rem;
+        padding-bottom: 2.4rem;
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+        border-right: 1px solid rgba(148, 163, 184, 0.12);
+    }
+    [data-testid="stMetric"] {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(17, 24, 39, 0.85));
+        border: 1px solid rgba(148, 163, 184, 0.14);
+        border-radius: 18px;
+        padding: 0.35rem 0.8rem;
+        box-shadow: 0 18px 40px rgba(2, 6, 23, 0.18);
+    }
+    .astrion-hero {
+        background:
+            radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 34%),
+            linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(17, 24, 39, 0.92));
+        border: 1px solid rgba(148, 163, 184, 0.14);
+        border-radius: 24px;
+        padding: 1.35rem 1.5rem 1.1rem 1.5rem;
+        margin-bottom: 1.25rem;
+        box-shadow: 0 24px 60px rgba(2, 6, 23, 0.22);
+    }
+    .astrion-kicker {
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        color: #67e8f9;
+        font-weight: 700;
+        margin-bottom: 0.45rem;
+    }
+    .astrion-title {
+        font-size: 2.35rem;
+        line-height: 1.05;
+        font-weight: 800;
+        color: #f8fafc;
+        margin: 0 0 0.55rem 0;
+    }
+    .astrion-subtitle {
+        color: #cbd5e1;
+        font-size: 1rem;
+        line-height: 1.6;
+        max-width: 58rem;
+        margin-bottom: 0.9rem;
+    }
+    .astrion-pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+    }
+    .astrion-pill {
+        display: inline-block;
+        padding: 0.4rem 0.8rem;
+        border-radius: 999px;
+        border: 1px solid rgba(125, 211, 252, 0.18);
+        background: rgba(30, 41, 59, 0.72);
+        color: #e2e8f0;
+        font-size: 0.84rem;
+        font-weight: 600;
+    }
+    .astrion-section-note {
+        background: rgba(15, 23, 42, 0.68);
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        border-radius: 18px;
+        padding: 0.95rem 1rem;
+        margin: 0 0 1rem 0;
+        color: #cbd5e1;
+    }
+    .astrion-sidebar-note {
+        background: rgba(15, 23, 42, 0.72);
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        border-radius: 18px;
+        padding: 0.85rem 0.9rem;
+        margin: 0.5rem 0 1rem 0;
+        color: #cbd5e1;
+        font-size: 0.92rem;
+        line-height: 1.5;
+    }
+    .astrion-sidebar-note strong {
+        color: #f8fafc;
+    }
+    div.stButton > button {
+        border-radius: 999px;
+        min-height: 2.9rem;
+        font-weight: 650;
+    }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _format_run_timestamp(ts: str) -> str:
+    if not ts:
+        return "Not available"
+    return ts.replace("T", " ").replace("+00:00", " UTC")
+
+
+def _issue_metrics(issues: list[dict]) -> dict[str, float | int]:
+    from astrion_dq.config import CONFIDENCE_THRESHOLD
+
+    total = len(issues)
+    high_count = sum(1 for issue in issues if issue.get("severity") == "high")
+    medium_count = sum(1 for issue in issues if issue.get("severity") == "medium")
+    avg_score = sum(issue.get("impact_score", 0.0) for issue in issues) / max(total, 1)
+    avg_conf = sum(issue.get("confidence", 1.0) for issue in issues) / max(total, 1)
+    impacted_reports = len(
+        {
+            report
+            for issue in issues
+            for report in (issue.get("affected_reports") or [])
+        }
+    )
+    needs_review = sum(
+        1 for issue in issues
+        if issue.get("confidence", 1.0) < CONFIDENCE_THRESHOLD
+    )
+    return {
+        "total": total,
+        "high": high_count,
+        "medium": medium_count,
+        "avg_score": avg_score,
+        "avg_conf": avg_conf,
+        "impacted_reports": impacted_reports,
+        "needs_review": needs_review,
+    }
+
+
+def _issue_dataframe(issues: list[dict], limit: int = 50) -> pd.DataFrame:
+    rows = []
+    for rank, issue in enumerate(issues[:limit], start=1):
+        rows.append({
+            "Rank": rank,
+            "Issue ID": issue.get("issue_id", ""),
+            "Issue Type": issue.get("issue_type", ""),
+            "Table": issue.get("table", ""),
+            "Columns": ", ".join(issue.get("columns") or []) or "n/a",
+            "Severity": issue.get("severity", "low").upper(),
+            "BIS": round(issue.get("impact_score", 0.0), 4),
+            "Confidence": round(issue.get("confidence", 1.0), 2),
+            "Evidence Rows": issue.get("evidence_rows", 0),
+            "Description": issue.get("description", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_issue_distribution_charts(issues: list[dict], key_prefix: str) -> None:
+    chart_col1, chart_col2 = st.columns(2)
+
+    type_counts: dict[str, int] = {}
+    table_scores: dict[str, float] = {}
+    for issue in issues:
+        issue_type = issue.get("issue_type", "unknown")
+        issue_table = issue.get("table", "unknown")
+        type_counts[issue_type] = type_counts.get(issue_type, 0) + 1
+        table_scores[issue_table] = table_scores.get(issue_table, 0.0) + issue.get("impact_score", 0.0)
+
+    with chart_col1:
+        st.caption("Issue volume by failure type")
+        if type_counts:
+            df_type = pd.DataFrame(
+                list(type_counts.items()), columns=["Issue Type", "Count"]
+            ).sort_values("Count", ascending=False)
+            st.altair_chart(
+                alt.Chart(df_type).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                    x=alt.X("Issue Type:N", sort="-y", title=None),
+                    y=alt.Y("Count:Q", title="Count"),
+                    color=alt.value("#38bdf8"),
+                    tooltip=["Issue Type", "Count"],
+                ).properties(height=260),
+                use_container_width=True,
+            )
+        else:
+            st.info("No issue distribution available yet.")
+
+    with chart_col2:
+        st.caption("Business impact concentration by table")
+        if table_scores:
+            df_table = pd.DataFrame(
+                list(table_scores.items()), columns=["Table", "Total BIS"]
+            ).sort_values("Total BIS", ascending=False)
+            st.altair_chart(
+                alt.Chart(df_table).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                    x=alt.X("Table:N", sort="-y", title=None),
+                    y=alt.Y("Total BIS:Q", title="Total BIS"),
+                    color=alt.value("#f59e0b"),
+                    tooltip=["Table", "Total BIS"],
+                ).properties(height=260),
+                use_container_width=True,
+            )
+        else:
+            st.info("No table concentration data available yet.")
+
+
+def _render_strategy_benchmark(eval_data: list[dict]) -> None:
+    st.caption(
+        "Benchmark the three workflow variants against injected ground truth. "
+        "Keep this for technical reviews, not for daily analyst operations."
+    )
+
+    if not eval_data:
+        st.info("No benchmark output found. Use `Benchmark Engine` in Admin & Demo Tools.")
+        return
+
+    metric_keys = [
+        ("precision", "Precision"),
+        ("recall", "Recall"),
+        ("f1", "F1"),
+        ("top_5_recall", "Top-5 Recall"),
+        ("noise_rate", "Noise Rate"),
+        ("summary_accuracy", "Summary Accuracy"),
+        ("wall_seconds", "Wall Time (s)"),
+    ]
+    by_strategy = {row["strategy"]: row for row in eval_data}
+
+    rows = []
+    for key, label in metric_keys:
+        row: dict[str, str] = {"Metric": label}
+        for strat_key, col_label in [
+            ("A_baseline", "Baseline"),
+            ("B_supervisor", "Supervisor"),
+            ("C_full", "Full"),
+        ]:
+            value = by_strategy.get(strat_key, {}).get(key)
+            if value is None:
+                row[col_label] = "n/a"
+            elif isinstance(value, float):
+                row[col_label] = f"{value:.4f}"
+            else:
+                row[col_label] = str(value)
+        rows.append(row)
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    for row in eval_data:
+        trace = row.get("agent_trace") or []
+        if trace:
+            with st.expander(f"Agent trace: {row.get('strategy', '')}"):
+                st.code(" -> ".join(trace))
+
+
+def _render_architecture_reference() -> None:
+    st.markdown(
+        """
+Astrion DQ is a retail data quality triage system built around a LangGraph workflow with deterministic supervisor routing.
 
 **What it does**
 
-Loads a retail star schema (six dimension tables, one fact table) from CSV into
-an in-process DuckDB database. Runs five rule-based quality checks plus
-statistical drift detection. Cross-validates every issue with an independent SQL
-query. Ranks surviving issues by a V2 Business Impact Score. Produces a markdown
-triage report and JSON output files.
+Loads a retail star schema from CSV into DuckDB, runs rule-based quality checks plus drift detection, cross-validates every issue with SQL, ranks the surviving issues by Business Impact Score, and generates reports for business and engineering teams.
 
-**Graph nodes**
+**Workflow**
 
 ```
-data_loader    -- load CSVs, register tables in DuckDB
-profiler       -- infer table roles, PKs, FKs, column types
-detector       -- five parallel checks: nulls, duplicates, outliers, dates, RI
-drift_detector -- PSI + KS test against a saved baseline snapshot
-debugger       -- SQL cross-validation, per-issue confidence score
-human_review   -- interrupt for analyst input (auto-approved in evaluation runs)
-ranker         -- V2 Business Impact Score, descending sort
-summariser     -- structured markdown report with per-issue resolution SQL
+data_loader    -> load CSVs and register tables
+profiler       -> infer PKs, FKs, roles, and types
+detector       -> nulls, duplicates, outliers, dates, referential integrity
+drift_detector -> PSI + KS test against the saved baseline
+debugger       -> SQL cross-validation and confidence scoring
+human_review   -> optional analyst approval step
+ranker         -> Business Impact Score ordering
+summariser     -> markdown report and fix guidance
 ```
 
-**Routing**
-
-A single deterministic ``_route()`` function in ``workflow.py`` reads completion
-flags from the state dict. No LLM routing.
-
-**Three evaluation strategies**
+**Evaluation variants**
 
 ```
-A Baseline  : data_loader -> profiler -> detector -> ranker
-B Supervisor: A + debugger + human_review
-C Full      : B + drift_detector
+Baseline   : data_loader -> profiler -> detector -> ranker
+Supervisor : baseline + debugger + human_review
+Full       : supervisor + drift_detector
 ```
 
-**V2 Business Impact Score**
+**Operations**
 
 ```
-BIS = base_weight × severity_weight × evidence_density × report_criticality
+Run Assessment  -> astrion-dq triage
+Set Baseline    -> astrion-dq snapshot
+Load Demo Data  -> astrion-dq inject
+Benchmark       -> astrion-dq evaluate
+Export PDF      -> astrion-dq report
 ```
 
-**CLI commands**
-
-```
-astrion-dq snapshot            Save baseline drift snapshot
-astrion-dq inject              Inject synthetic issues (ground truth)
-astrion-dq triage              Run full triage workflow
-astrion-dq evaluate            Compare strategies A, B, C
-astrion-dq report              Generate PDF triage report
-astrion-dq dashboard           Launch this dashboard
-astrion-dq serve               Start REST API server (port 8000)
-```
-
-**REST API (astrion-dq serve)**
-
-```
-GET  /health                   Liveness probe (no auth required)
-POST /triage                   Run pipeline, returns ranked issues + run_id
-GET  /runs/{run_id}            Look up a past run from run_log.jsonl
-```
-
-Set ``ASTRION_API_TOKEN`` to require a Bearer token on API and dashboard requests.
+Set ``ASTRION_API_TOKEN`` to protect the API. Set ``ASTRION_DASHBOARD_TOKEN`` separately if you also want a login prompt on the dashboard.
         """
     )
 
-# ============================================================================
-# TAB 6: SQL ASSISTANT
-# ============================================================================
-with tab_sql:
-    st.header("SQL Assistant")
-    st.caption(
-        "An LLM-powered data engineer agent. Ask it to explain issues, "
-        "write investigation queries, fix SQL errors, or generate remediation scripts. "
-        "SQL blocks in responses are auto-executed against the live DuckDB."
-    )
 
-    # Connection status banner
+def _render_investigation_assistant() -> None:
+    st.header("Investigation Assistant")
+    st.caption(
+        "Use the assistant to explain issues, generate DuckDB investigation SQL, "
+        "or rewrite failing queries. SQL blocks run automatically against the active dataset."
+    )
+    if _API_BASE_URL:
+        st.caption(
+            f"LLM responses are proxied through `{_API_BASE_URL}`. "
+            "This Streamlit app does not store the OpenRouter key."
+        )
+
     conn, schema_desc = _get_schema_context()
     if conn is None:
         st.warning(
-            "No database loaded. Run **Triage** (sidebar) to load the retail dataset, "
-            "or upload CSVs in the **Upload & Analyze** tab. "
-            "The agent will still answer questions without a live connection."
+            "No database is loaded yet. Run **Run Assessment** for the retail warehouse or use "
+            "**Ad Hoc Analysis** in Overview to upload CSVs. The assistant can still answer at a high level."
         )
     else:
         with st.expander("Connected schema", expanded=False):
             st.code(schema_desc or "(empty)", language="sql")
 
-    # Conversation controls
-    col_ctrl1, col_ctrl2 = st.columns([6, 1])
-    with col_ctrl2:
-        if st.button("Clear chat", key="clear_agent"):
+    cue_col1, cue_col2, cue_col3 = st.columns(3)
+    cue_col1.markdown(
+        "<div class='astrion-section-note'><strong>Ask for evidence</strong><br/>"
+        "“Show me the rows behind the top-ranked referential-integrity break.”</div>",
+        unsafe_allow_html=True,
+    )
+    cue_col2.markdown(
+        "<div class='astrion-section-note'><strong>Ask for remediation</strong><br/>"
+        "“Draft DuckDB SQL to quarantine duplicate order rows.”</div>",
+        unsafe_allow_html=True,
+    )
+    cue_col3.markdown(
+        "<div class='astrion-section-note'><strong>Ask for explanation</strong><br/>"
+        "“Explain why this issue impacts downstream sales reporting.”</div>",
+        unsafe_allow_html=True,
+    )
+
+    control_col1, control_col2 = st.columns([6, 1])
+    with control_col2:
+        if st.button("Clear Chat", key="clear_agent"):
             st.session_state["_agent_messages"] = []
             st.rerun()
 
-    # Initialise conversation history
     if "_agent_messages" not in st.session_state:
         st.session_state["_agent_messages"] = []
 
-    # Render existing messages
     for msg in st.session_state["_agent_messages"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            # Re-render SQL results stored alongside the message
             for sql, result in msg.get("sql_results", []):
                 st.caption(f"Executed: `{sql[:80]}{'...' if len(sql) > 80 else ''}`")
                 if isinstance(result, pd.DataFrame):
@@ -924,71 +969,54 @@ with tab_sql:
                 else:
                     st.error(result)
 
-    # New user input
     if user_input := st.chat_input(
-        "Ask about your data... e.g. 'Why does customer_sk fail FK checks?' "
-        "or 'Show me the top 10 outlier rows in total_amount'"
+        "Ask the assistant to explain an issue, generate DuckDB SQL, or fix a query"
     ):
-        # Display user turn
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # Append to history
         st.session_state["_agent_messages"].append(
             {"role": "user", "content": user_input, "sql_results": []}
         )
 
-        # Generate response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 response = _sql_agent_respond(user_input)
 
             st.markdown(response)
 
-            # Auto-execute SQL blocks if connection is available
             sql_results = []
             if conn is not None:
                 results = _execute_sql_blocks(response, conn)
                 for sql, result in results:
-                    st.caption(
-                        f"Executed: `{sql[:80]}{'...' if len(sql) > 80 else ''}`"
-                    )
+                    st.caption(f"Executed: `{sql[:80]}{'...' if len(sql) > 80 else ''}`")
                     if isinstance(result, pd.DataFrame):
                         st.dataframe(result.head(50), use_container_width=True)
-                        sql_results.append((sql, result))
                     else:
                         st.error(result)
-                        sql_results.append((sql, result))
+                    sql_results.append((sql, result))
 
         st.session_state["_agent_messages"].append(
             {"role": "assistant", "content": response, "sql_results": sql_results}
         )
 
-# ============================================================================
-# TAB 7: UPLOAD & ANALYZE
-# ============================================================================
-with tab_upload:
-    st.header("Upload & Analyze")
+
+def _render_upload_workspace() -> None:
+    st.subheader("Ad Hoc Analysis Workspace")
     st.caption(
-        "Upload your own CSV files. The default path runs a verified analysis: "
-        "profiler -> detector -> SQL cross-validation -> ranker. "
-        "Each file becomes one table, and the SQL Assistant connects to the uploaded data."
-    )
-    st.caption(
-        "You can also enable drift detection by uploading a matching baseline dataset. "
-        "Without a baseline upload, the workflow skips drift and runs the verified path only."
+        "Upload CSVs for one-off investigations. The workspace runs a verified path "
+        "through profiling, detection, SQL cross-validation, ranking, and optional drift checks."
     )
 
     uploader_version = st.session_state.setdefault("_upload_uploader_version", 0)
     reset_col, help_col = st.columns([1, 2])
     with reset_col:
-        if st.button("Clear Uploaded Files", key="clear_upload_session", use_container_width=True):
+        if st.button("Clear Upload", key="clear_upload_session", use_container_width=True):
             _reset_upload_session()
             st.rerun()
     with help_col:
         st.caption(
-            "Use this if you uploaded the wrong file or need to reset an oversize upload. "
-            "It clears the uploader, upload results, and uploaded SQL Assistant context."
+            "Use this when you want to replace the uploaded files or clear the uploaded SQL Assistant context."
         )
 
     uploaded_files = st.file_uploader(
@@ -999,10 +1027,9 @@ with tab_upload:
     )
 
     enable_upload_drift = st.toggle(
-        "Enable drift detection using a baseline upload",
+        "Enable drift comparison with a baseline upload",
         key="enable_upload_drift",
-        help="Upload a second dataset with matching table and column names to compare "
-             "the current upload against a trusted baseline.",
+        help="Upload a second dataset with matching tables and columns to compare against a trusted baseline.",
     )
 
     baseline_files = []
@@ -1014,167 +1041,476 @@ with tab_upload:
             key=f"csv_baseline_uploader_{uploader_version}",
         )
 
-    if uploaded_files:
-        # ── Load and validate ──────────────────────────────────────────────
-        tables, load_errors = _load_uploaded_tables(uploaded_files)
-        baseline_tables: dict[str, pd.DataFrame] = {}
-        baseline_errors: list[str] = []
+    if not uploaded_files:
+        if st.session_state.get("_upload_results") is not None:
+            st.info("Uploaded analysis results remain available below until you clear the upload session.")
+        return
 
-        if enable_upload_drift and baseline_files:
-            baseline_tables, baseline_errors = _load_uploaded_tables(baseline_files)
+    tables, load_errors = _load_uploaded_tables(uploaded_files)
+    baseline_tables: dict[str, pd.DataFrame] = {}
+    baseline_errors: list[str] = []
 
-        for err in load_errors:
-            st.warning(err)
-        for err in baseline_errors:
-            st.warning(f"Baseline: {err}")
+    if enable_upload_drift and baseline_files:
+        baseline_tables, baseline_errors = _load_uploaded_tables(baseline_files)
 
-        if not tables:
-            st.error("No valid CSV files loaded. Check the warnings above.")
-        else:
-            # ── Preview ───────────────────────────────────────────────────
-            st.subheader(f"{len(tables)} table(s) loaded")
-            for tname, df in tables.items():
-                with st.expander(f"`{tname}` — {len(df):,} rows × {df.shape[1]} columns"):
-                    st.dataframe(df.head(10), use_container_width=True)
+    for err in load_errors:
+        st.warning(err)
+    for err in baseline_errors:
+        st.warning(f"Baseline: {err}")
 
-            st.divider()
+    if not tables:
+        st.error("No valid CSV files loaded. Check the warnings above.")
+        return
 
-            baseline_ready = bool(baseline_tables)
-            drift_enabled = enable_upload_drift and baseline_ready
+    st.markdown(
+        f"<div class='astrion-section-note'><strong>{len(tables)} table(s) loaded.</strong> "
+        "Review the previews below, then run the ad hoc assessment.</div>",
+        unsafe_allow_html=True,
+    )
 
-            if enable_upload_drift and not baseline_ready:
-                st.info(
-                    "Upload baseline CSVs to enable drift detection. "
-                    "Otherwise the analysis will run without drift."
-                )
-            elif drift_enabled:
-                matching_tables = sorted(set(tables) & set(baseline_tables))
-                st.success(
-                    f"Drift detection enabled across {len(matching_tables)} matching table(s): "
-                    f"{', '.join(matching_tables) if matching_tables else 'none'}."
-                )
-                if not matching_tables:
-                    st.warning(
-                        "No table names match between current and baseline uploads, so drift "
-                        "checks will not produce signals until names align."
-                    )
+    for table_name, df in tables.items():
+        with st.expander(f"`{table_name}` — {len(df):,} rows × {df.shape[1]} columns"):
+            st.dataframe(df.head(10), use_container_width=True)
 
-            # ── Run Analysis button ───────────────────────────────────────
-            run_label = "Run Full Verified Analysis" if drift_enabled else "Run Verified Analysis"
-            spinner_label = (
-                "Running verified data quality + drift checks on uploaded data..."
-                if drift_enabled else
-                "Running verified data quality checks on uploaded data..."
+    st.divider()
+
+    baseline_ready = bool(baseline_tables)
+    drift_enabled = enable_upload_drift and baseline_ready
+
+    if enable_upload_drift and not baseline_ready:
+        st.info("Upload baseline CSVs to enable drift detection. Otherwise the analysis runs without drift.")
+    elif drift_enabled:
+        matching_tables = sorted(set(tables) & set(baseline_tables))
+        st.success(
+            f"Drift comparison enabled across {len(matching_tables)} matching table(s): "
+            f"{', '.join(matching_tables) if matching_tables else 'none'}."
+        )
+        if not matching_tables:
+            st.warning(
+                "No table names match between the current and baseline uploads, so drift signals will stay empty until the names align."
             )
-            if st.button(run_label, type="primary", key="run_upload_triage"):
-                with st.spinner(spinner_label):
-                    try:
-                        ranked = _run_upload_triage(
-                            tables,
-                            baseline_tables=baseline_tables if drift_enabled else None,
-                        )
-                        st.session_state["_upload_results"] = ranked
-                        # Build DuckDB connection for SQL Agent
-                        _close_upload_conn()
-                        st.session_state["_upload_conn"] = _build_upload_conn(tables)
-                        st.session_state["_upload_report_md"] = _generate_upload_report(ranked)
-                        if drift_enabled:
-                            st.success(
-                                f"Full verified analysis complete — {len(ranked)} issue(s) found."
-                            )
-                        else:
-                            st.success(
-                                f"Verified analysis complete — {len(ranked)} issue(s) found."
-                            )
-                    except Exception as exc:
-                        st.error(f"Analysis failed: {exc}")
 
-            # ── Results (shown after analysis runs) ───────────────────────
-            ranked = st.session_state.get("_upload_results")
-            if ranked is not None:
-                st.subheader(f"Issues ({len(ranked)} found)")
-
-                if not ranked:
-                    st.success("No data quality issues detected in the uploaded files.")
-                else:
-                    # Metrics row
-                    from astrion_dq.config import CONFIDENCE_THRESHOLD
-
-                    total = len(ranked)
-                    high_c = sum(1 for r in ranked if r.get("severity") == "high")
-                    med_c = sum(1 for r in ranked if r.get("severity") == "medium")
-                    avg_bis = sum(r.get("impact_score", 0) for r in ranked) / max(total, 1)
-                    avg_conf = sum(r.get("confidence", 1.0) for r in ranked) / max(total, 1)
-                    needs_review = sum(
-                        1 for r in ranked
-                        if r.get("confidence", 1.0) < CONFIDENCE_THRESHOLD
-                    )
-
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Total Issues", total)
-                    m2.metric("HIGH", high_c)
-                    m3.metric("MEDIUM", med_c)
-                    m4.metric("Avg BIS", f"{avg_bis:.4f}")
-                    m5.metric("Avg Confidence", f"{avg_conf:.2f}")
-
-                    if needs_review:
-                        st.warning(
-                            f"{needs_review} issue(s) have confidence below "
-                            f"{CONFIDENCE_THRESHOLD:.2f} and should be reviewed manually."
-                        )
-
-                    # Issues table
-                    rows_out = []
-                    for rank, r in enumerate(ranked[:50], 1):
-                        rows_out.append({
-                            "Rank": rank,
-                            "Issue ID": r.get("issue_id", ""),
-                            "Issue Type": r.get("issue_type", ""),
-                            "Table": r.get("table", ""),
-                            "Columns": ", ".join(r.get("columns") or []) or "n/a",
-                            "Severity": r.get("severity", "").upper(),
-                            "BIS": round(r.get("impact_score", 0.0), 4),
-                            "Confidence": round(r.get("confidence", 1.0), 2),
-                            "Evidence Rows": r.get("evidence_rows", 0),
-                            "Description": r.get("description", ""),
-                        })
-                    st.dataframe(
-                        pd.DataFrame(rows_out),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    # Distribution chart
-                    type_counts: dict = {}
-                    for r in ranked:
-                        k = r.get("issue_type", "unknown")
-                        type_counts[k] = type_counts.get(k, 0) + 1
-                    df_tc = pd.DataFrame(
-                        list(type_counts.items()), columns=["Issue Type", "Count"]
-                    ).sort_values("Count", ascending=False)
-                    st.altair_chart(
-                        alt.Chart(df_tc).mark_bar().encode(
-                            x=alt.X("Issue Type:N", sort="-y"),
-                            y=alt.Y("Count:Q"),
-                            tooltip=["Issue Type", "Count"],
-                        ).properties(height=220, title="Issues by type"),
-                        use_container_width=True,
-                    )
-
-                # ── Resolution Report ────────────────────────────────────
-                st.divider()
-                st.subheader("Resolution Report")
-                report_md = st.session_state.get("_upload_report_md", "")
-                if report_md:
-                    st.markdown(report_md)
-                    st.download_button(
-                        label="Download report (.md)",
-                        data=report_md.encode("utf-8"),
-                        file_name="upload_triage_report.md",
-                        mime="text/markdown",
-                    )
-
-                st.info(
-                    "The uploaded tables are now available in the **SQL Assistant** tab. "
-                    "Ask the agent to investigate or fix any of the issues above."
+    run_label = "Analyze Upload with Drift Checks" if drift_enabled else "Analyze Upload"
+    spinner_label = (
+        "Running verified data quality and drift checks on uploaded data..."
+        if drift_enabled else
+        "Running verified data quality checks on uploaded data..."
+    )
+    if st.button(run_label, type="primary", key="run_upload_triage"):
+        with st.spinner(spinner_label):
+            try:
+                ranked = _run_upload_triage(
+                    tables,
+                    baseline_tables=baseline_tables if drift_enabled else None,
                 )
+                st.session_state["_upload_results"] = ranked
+                _close_upload_conn()
+                st.session_state["_upload_conn"] = _build_upload_conn(tables)
+                st.session_state["_upload_report_md"] = _generate_upload_report(ranked)
+                st.success(f"Ad hoc analysis complete — {len(ranked)} issue(s) found.")
+            except Exception as exc:
+                st.error(f"Analysis failed: {exc}")
+
+    ranked = st.session_state.get("_upload_results")
+    if ranked is None:
+        return
+
+    st.subheader(f"Uploaded Issues ({len(ranked)} found)")
+    if not ranked:
+        st.success("No data quality issues detected in the uploaded files.")
+    else:
+        metrics = _issue_metrics(ranked)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Issues", metrics["total"])
+        m2.metric("Critical", metrics["high"])
+        m3.metric("Medium", metrics["medium"])
+        m4.metric("Avg BIS", f"{metrics['avg_score']:.4f}")
+        m5.metric("Needs Review", metrics["needs_review"])
+
+        st.dataframe(
+            _issue_dataframe(ranked),
+            use_container_width=True,
+            hide_index=True,
+        )
+        _render_issue_distribution_charts(ranked, "upload")
+
+    st.divider()
+    st.subheader("Upload Resolution Report")
+    report_md = st.session_state.get("_upload_report_md", "")
+    if report_md:
+        st.markdown(report_md)
+        st.download_button(
+            label="Download upload report (.md)",
+            data=report_md.encode("utf-8"),
+            file_name="upload_triage_report.md",
+            mime="text/markdown",
+            key="download_upload_report",
+        )
+
+    st.info(
+        "The uploaded tables are now available in **Investigation**. Use the assistant to inspect or remediate the uploaded issues."
+    )
+
+
+def _render_no_assessment_message() -> None:
+    st.info(
+        "No assessment output is available yet. Use **Run Assessment** in the sidebar. "
+        "If you need seeded demo issues first, open **Admin & Demo Tools** and run **Load Demo Data**."
+    )
+
+
+_inject_dashboard_styles()
+
+from astrion_dq.config import SNAPSHOTS_DIR
+
+snapshot_path = SNAPSHOTS_DIR / "snapshot_baseline.json"
+source_labels = {
+    "injected": "Injected Scenario",
+    "clean": "Clean Baseline",
+}
+
+with st.sidebar:
+    run_entries = load_run_log()
+    latest_run = run_entries[0] if run_entries else {}
+    latest_run_label = _format_run_timestamp(latest_run.get("timestamp", ""))
+
+    st.title("Astrion DQ")
+    st.caption("Enterprise Data Quality Command Center")
+    st.markdown(
+        "<div class='astrion-sidebar-note'>"
+        "<strong>Focus mode</strong><br/>"
+        "Daily operators should run the assessment, review priority issues, investigate root causes, and export reports. "
+        "Demo and benchmark actions are grouped separately below."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Operational Context")
+    data_source = st.selectbox("Active dataset", ["injected", "clean"], key="src")
+    st.caption(f"Last recorded run: {latest_run_label}")
+    st.caption(f"Baseline snapshot: {'Ready' if snapshot_path.exists() else 'Not set'}")
+    st.caption(f"API mode: {'Connected' if _API_BASE_URL else 'Local'}")
+
+    _running = st.session_state.get("_running", False)
+    if st.button("Run Assessment", use_container_width=True, type="primary", disabled=_running):
+        st.session_state["_running"] = True
+        with st.spinner(f"Running assessment on {data_source!r}..."):
+            ok, out = run_cli(["triage", "--source", data_source, "--sensitivity", "high"])
+        st.session_state["_running"] = False
+        if ok:
+            _ensure_retail_live_connection(data_source)
+            st.success("Assessment complete.")
+            st.cache_data.clear()
+        else:
+            st.error(f"Failed:\n{out[:400]}")
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        if st.button("Refresh Data", use_container_width=True, disabled=_running, key="refresh_dashboard"):
+            st.cache_data.clear()
+            st.rerun()
+    with action_col2:
+        if st.button("Export PDF", use_container_width=True, disabled=_running, key="export_dashboard_pdf"):
+            st.session_state["_running"] = True
+            with st.spinner("Preparing PDF report..."):
+                ok, out = run_cli(["report", "--source", data_source])
+            st.session_state["_running"] = False
+            if ok:
+                st.success("PDF report prepared.")
+                st.cache_data.clear()
+            else:
+                st.error(f"Failed:\n{out[:400]}")
+
+    with st.expander("Admin & Demo Tools", expanded=False):
+        st.caption(
+            "Use these actions when preparing a demonstration, resetting the drift baseline, "
+            "or comparing workflow variants."
+        )
+        if st.button("Set Baseline", use_container_width=True, disabled=_running, key="set_baseline"):
+            st.session_state["_running"] = True
+            with st.spinner("Saving baseline snapshot..."):
+                ok, out = run_cli(["snapshot"])
+            st.session_state["_running"] = False
+            if ok:
+                st.success("Baseline updated.")
+                st.cache_data.clear()
+            else:
+                st.error(f"Failed:\n{out[:400]}")
+
+        if st.button("Load Demo Data", use_container_width=True, disabled=_running, key="load_demo_data"):
+            st.session_state["_running"] = True
+            with st.spinner("Injecting synthetic demo issues..."):
+                ok, out = run_cli(["inject"])
+            st.session_state["_running"] = False
+            if ok:
+                st.success("Demo scenario loaded.")
+                st.cache_data.clear()
+            else:
+                st.error(f"Failed:\n{out[:400]}")
+
+        if st.button("Benchmark Engine", use_container_width=True, disabled=_running, key="benchmark_engine"):
+            st.session_state["_running"] = True
+            with st.spinner("Evaluating workflow strategies..."):
+                ok, out = run_cli(["evaluate", "--source", "injected"])
+            st.session_state["_running"] = False
+            if ok:
+                st.success("Benchmark complete.")
+                st.cache_data.clear()
+            else:
+                st.error(f"Failed:\n{out[:400]}")
+
+    st.divider()
+    st.caption("v0.6.0 · Astrion Capstone 7")
+
+
+issues = load_ranked_issues(data_source)
+eval_data = load_evaluation()
+report_text = load_report_md(data_source)
+run_entries = load_run_log()
+latest_run_for_source = next((entry for entry in run_entries if entry.get("source") == data_source), {})
+latest_run_label = _format_run_timestamp(latest_run_for_source.get("timestamp", ""))
+metrics = _issue_metrics(issues) if issues else None
+summary_text = ""
+summary_error = ""
+if _API_BASE_URL and issues:
+    summary_result = _fetch_remote_summary(
+        data_source,
+        json.dumps(issues[:25], sort_keys=True),
+    )
+    summary_text = str(summary_result.get("summary") or "").strip()
+    summary_error = str(summary_result.get("error") or "").strip()
+
+status_pills = [
+    f"Dataset: {source_labels.get(data_source, data_source.title())}",
+    f"Baseline: {'Ready' if snapshot_path.exists() else 'Not Set'}",
+    f"API: {'Connected' if _API_BASE_URL else 'Local'}",
+    f"Last Run: {latest_run_label}",
+]
+if st.session_state.get("_upload_results") is not None:
+    status_pills.append("Ad Hoc Upload: Active")
+
+st.markdown(
+    (
+        "<section class='astrion-hero'>"
+        "<div class='astrion-kicker'>Operational Data Quality</div>"
+        "<h1 class='astrion-title'>Enterprise Retail Data Health Workspace</h1>"
+        "<p class='astrion-subtitle'>Monitor business-critical data quality signals, "
+        "prioritise remediation by impact, investigate failures with SQL, and export a review-ready report without exposing the underlying engineering controls by default.</p>"
+        "<div class='astrion-pill-row'>"
+        + "".join(f"<span class='astrion-pill'>{pill}</span>" for pill in status_pills)
+        + "</div></section>"
+    ),
+    unsafe_allow_html=True,
+)
+
+(
+    tab_overview,
+    tab_issues,
+    tab_investigation,
+    tab_reports,
+    tab_audit,
+) = st.tabs([
+    "Overview",
+    "Issues",
+    "Investigation",
+    "Reports",
+    "Audit",
+])
+
+with tab_overview:
+    st.header("Operational Overview")
+    st.caption(
+        "Start here to assess overall data health, current priority queues, and whether the baseline and reporting outputs are ready."
+    )
+
+    if not issues:
+        _render_no_assessment_message()
+    else:
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Issues", metrics["total"])
+        m2.metric("Critical Issues", metrics["high"])
+        m3.metric("Impacted Reports", metrics["impacted_reports"])
+        m4.metric("Needs Review", metrics["needs_review"])
+        m5.metric("Average Confidence", f"{metrics['avg_conf']:.2f}")
+
+        st.markdown(
+            "<div class='astrion-section-note'><strong>Priority Queue</strong><br/>"
+            "Review the highest-ranked issues first. Critical referential-integrity breaks and high-BIS null or duplication issues are the fastest route to business risk reduction."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        top_issue_cols = st.columns([1.4, 1])
+        with top_issue_cols[0]:
+            st.subheader("Top Priority Issues")
+            st.dataframe(
+                _issue_dataframe(issues, limit=10),
+                use_container_width=True,
+                hide_index=True,
+            )
+        with top_issue_cols[1]:
+            st.subheader("Current Operating Notes")
+            st.markdown(
+                "\n".join(
+                    [
+                        f"- Active dataset: `{source_labels.get(data_source, data_source.title())}`",
+                        f"- Last run completed: `{latest_run_label}`",
+                        f"- Baseline status: `{'Ready' if snapshot_path.exists() else 'Not Set'}`",
+                        f"- Executive summary: `{'Available' if summary_text else 'Pending'}`",
+                        f"- Upload workspace: `{'Active' if st.session_state.get('_upload_results') is not None else 'Idle'}`",
+                    ]
+                )
+            )
+
+        st.divider()
+        st.subheader("Impact Distribution")
+        _render_issue_distribution_charts(issues, "overview")
+
+    with st.expander(
+        "Ad Hoc Analysis Workspace",
+        expanded=bool(st.session_state.get("_upload_results")),
+    ):
+        _render_upload_workspace()
+
+with tab_issues:
+    st.header("Priority Issues")
+    st.caption(
+        "Filter the current issue queue by severity, failure mode, and source table. Use this view for analyst triage and remediation planning."
+    )
+
+    if not issues:
+        _render_no_assessment_message()
+    else:
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+        with filter_col1:
+            severity_filter = st.multiselect(
+                "Severity",
+                ["high", "medium", "low"],
+                default=["high", "medium"],
+                key="issues_severity_filter",
+            )
+        with filter_col2:
+            type_filter = st.multiselect(
+                "Failure mode",
+                sorted({issue.get("issue_type", "") for issue in issues}),
+                default=[],
+                key="issues_type_filter",
+            )
+        with filter_col3:
+            table_filter = st.multiselect(
+                "Table",
+                sorted({issue.get("table", "") for issue in issues}),
+                default=[],
+                key="issues_table_filter",
+            )
+
+        filtered = [
+            issue for issue in issues
+            if issue.get("severity") in severity_filter
+            and (not type_filter or issue.get("issue_type") in type_filter)
+            and (not table_filter or issue.get("table") in table_filter)
+        ]
+
+        st.dataframe(
+            _issue_dataframe(filtered),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        detail_col1, detail_col2 = st.columns([1.4, 1])
+        with detail_col1:
+            low_conf = [issue for issue in filtered if issue.get("confidence", 1.0) < 0.70]
+            st.subheader("Review Queue")
+            if low_conf:
+                st.dataframe(
+                    _issue_dataframe(low_conf, limit=15),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.success("No current issues fall below the manual-review confidence threshold.")
+        with detail_col2:
+            st.subheader("Impacted Business Reports")
+            impacted_rows = []
+            for issue in filtered[:20]:
+                for report in issue.get("affected_reports") or []:
+                    impacted_rows.append({
+                        "Issue ID": issue.get("issue_id", ""),
+                        "Report": report,
+                        "Table": issue.get("table", ""),
+                        "Severity": issue.get("severity", ""),
+                    })
+            if impacted_rows:
+                st.dataframe(pd.DataFrame(impacted_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No impacted-report mapping is available for the current filter set.")
+
+with tab_investigation:
+    _render_investigation_assistant()
+
+with tab_reports:
+    st.header("Executive Reports")
+    st.caption(
+        "Use this view for business communication, exported documents, and model benchmark outputs used in technical reviews."
+    )
+
+    download_col1, download_col2 = st.columns([1, 1])
+    pdf_path = OUTPUTS_DIR / f"triage_report_{data_source}.pdf"
+    if report_text:
+        with download_col1:
+            st.download_button(
+                "Download Markdown",
+                data=report_text.encode("utf-8"),
+                file_name=f"triage_report_{data_source}.md",
+                mime="text/markdown",
+                key="download_retail_report_md",
+            )
+    if pdf_path.exists():
+        with download_col2:
+            st.download_button(
+                "Download PDF",
+                data=pdf_path.read_bytes(),
+                file_name=pdf_path.name,
+                mime="application/pdf",
+                key="download_retail_report_pdf",
+            )
+
+    if summary_text:
+        st.subheader("AI Executive Summary")
+        st.markdown(summary_text)
+        st.divider()
+    elif summary_error:
+        st.caption(f"Remote AI summary unavailable: {summary_error}")
+
+    if report_text is None and not summary_text:
+        st.info("No retail report is available yet. Run **Run Assessment** and then **Export PDF**.")
+    elif report_text is not None:
+        st.subheader("Detailed Report")
+        st.markdown(report_text)
+
+    with st.expander("Benchmark Engine", expanded=False):
+        _render_strategy_benchmark(eval_data)
+
+with tab_audit:
+    st.header("Audit Trail")
+    st.caption(
+        "Review recent operational runs, their agent traces, and the platform reference notes used during technical reviews."
+    )
+
+    if not run_entries:
+        st.info("No runs recorded yet. Run an assessment to seed the audit trail.")
+    else:
+        audit_rows = []
+        for entry in run_entries:
+            audit_rows.append({
+                "Run ID": entry.get("run_id", ""),
+                "Source": entry.get("source", ""),
+                "Timestamp (UTC)": entry.get("timestamp", ""),
+                "Issues Ranked": entry.get("issue_count", 0),
+                "Agent Trace": " -> ".join(entry.get("agent_trace") or []),
+            })
+        st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
+        st.caption(f"Showing {len(audit_rows)} run(s), most recent first.")
+
+    with st.expander("Platform Architecture", expanded=False):
+        _render_architecture_reference()

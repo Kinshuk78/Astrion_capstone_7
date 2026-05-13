@@ -20,3 +20,9 @@ def test_gitignore_ignores_local_env_files_but_keeps_example():
     text = Path(".gitignore").read_text(encoding="utf-8")
     assert "config/.env*" in text
     assert "!config/.env.example" in text
+
+
+def test_streamlit_secrets_example_uses_api_url_not_openrouter_key():
+    text = Path(".streamlit/secrets.toml.example").read_text(encoding="utf-8")
+    assert "ASTRION_API_URL" in text
+    assert "OPENROUTER_API_KEY =" not in text

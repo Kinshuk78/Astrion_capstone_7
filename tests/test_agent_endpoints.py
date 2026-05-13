@@ -326,6 +326,74 @@ def test_report_requires_auth(agent_client):
 
 
 # ---------------------------------------------------------------------------
+# POST /assistant/chat and /assistant/summary
+# ---------------------------------------------------------------------------
+
+def test_assistant_chat_returns_200(agent_client):
+    with patch("astrion_dq.llm.client.chat_with_history", return_value="```sql\nSELECT 1;\n```"):
+        resp = agent_client.post(
+            "/assistant/chat",
+            json={
+                "message": "Show me a query",
+                "history": [{"role": "user", "content": "Previous turn"}],
+                "schema_desc": "dq_retail.fact_sales(amount DOUBLE)",
+                "issues": _sample_issues(),
+            },
+            headers=_AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["response"]
+    assert resp.json()["used_fallback"] is False
+
+
+def test_assistant_chat_uses_fallback_when_llm_unavailable(agent_client):
+    from astrion_dq.llm.client import LLMUnavailable
+
+    with patch("astrion_dq.llm.client.chat_with_history", side_effect=LLMUnavailable("missing key")):
+        resp = agent_client.post(
+            "/assistant/chat",
+            json={"message": "Explain the top issue", "issues": _sample_issues()},
+            headers=_AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["used_fallback"] is True
+    assert "template-only" in resp.json()["response"]
+
+
+def test_assistant_chat_requires_auth(agent_client):
+    resp = agent_client.post("/assistant/chat", json={"message": "hello"})
+    assert resp.status_code == 401
+
+
+def test_assistant_summary_returns_200(agent_client):
+    with patch("astrion_dq.graph.nodes._llm_executive_summary", return_value="Executive summary text"):
+        resp = agent_client.post(
+            "/assistant/summary",
+            json={"issues": _sample_issues(), "source": "injected"},
+            headers=_AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["summary"] == "Executive summary text"
+    assert resp.json()["used_fallback"] is False
+
+
+def test_assistant_summary_uses_fallback_when_llm_returns_empty(agent_client):
+    with patch("astrion_dq.graph.nodes._llm_executive_summary", return_value=""):
+        resp = agent_client.post(
+            "/assistant/summary",
+            json={"issues": _sample_issues(), "source": "injected"},
+            headers=_AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["used_fallback"] is True
+    assert "Recommended Actions" in resp.json()["summary"]
+
+
+# ---------------------------------------------------------------------------
 # POST /analyze (async job)
 # ---------------------------------------------------------------------------
 

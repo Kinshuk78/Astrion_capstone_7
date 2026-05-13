@@ -6,6 +6,8 @@ Endpoints:
   GET  /jobs/{job_id}         -- poll job status and result
   GET  /runs/{run_id}         -- look up a past run from outputs/run_log.jsonl
   GET  /triage/report.pdf     -- generate and download a PDF report
+  POST /assistant/chat        -- SQL assistant reply via the API-held LLM key
+  POST /assistant/summary     -- executive summary via the API-held LLM key
 
 Authentication:
   Bearer token read from ASTRION_API_TOKEN env var.
@@ -42,7 +44,7 @@ from typing import Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -63,7 +65,7 @@ app = FastAPI(
         "POST /triage submits an async job; poll GET /jobs/{job_id} for results. "
         "Interactive docs: /docs — OpenAPI spec: /openapi.json"
     ),
-    version="0.6.0",
+    version="0.6.1",
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -137,6 +139,38 @@ class TriageResult(BaseModel):
     issue_count: int
     ranked_issues: List[dict]
     agent_trace: List[str]
+
+
+class AssistantMessage(BaseModel):
+    role: str
+    content: str
+
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, v: str) -> str:
+        if v not in ("user", "assistant"):
+            raise ValueError("role must be 'user' or 'assistant'")
+        return v
+
+
+class AssistantChatRequest(BaseModel):
+    message: str
+    history: List[AssistantMessage] = Field(default_factory=list)
+    schema_desc: str = ""
+    issues: List[dict] = Field(default_factory=list)
+    max_tokens: int = 1200
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("message must not be empty")
+        return v.strip()
+
+
+class AssistantSummaryRequest(BaseModel):
+    issues: List[dict] = Field(default_factory=list)
+    source: str = "injected"
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +340,113 @@ def get_run(
 
 
 # ---------------------------------------------------------------------------
+# LLM assistant helpers
+# ---------------------------------------------------------------------------
+
+def _assistant_issue_context(issues: List[dict], limit: int = 10) -> str:
+    lines: list[str] = []
+    for issue in issues[:limit]:
+        lines.append(
+            f"  [{issue.get('issue_id', '')}] {issue.get('issue_type', '')} "
+            f"in {issue.get('table', '')} — BIS={issue.get('impact_score', 0):.3f}, "
+            f"severity={issue.get('severity', '')}, "
+            f"evidence_rows={issue.get('evidence_rows', 0)}"
+        )
+    return "\n".join(lines) if lines else "  (no issues loaded yet)"
+
+
+def _assistant_system_prompt(schema_desc: str, issues_text: str) -> str:
+    return f"""You are an expert data engineer assistant specialised in DuckDB and retail data warehouse quality.
+
+You have access to a live DuckDB database with these tables:
+{schema_desc}
+
+Current data quality issues (ranked by Business Impact Score):
+{issues_text}
+
+Your role:
+1. Help the engineer understand what each issue means and why it exists
+2. Write correct DuckDB SQL to investigate and fix issues
+3. Explain SQL errors the engineer pastes — identify root cause and show the corrected query
+4. Suggest ETL improvements and data validation patterns
+5. Answer schema and data questions
+
+Rules:
+- Always use fully-qualified table names (e.g. dq_retail.fact_sales_normalized) for retail data
+- Format all SQL in ```sql ... ``` code blocks so it can be auto-executed
+- When multiple fix options exist, show each as a separate labelled SQL block
+- The DuckDB instance is in-memory — modifications are safe and non-persistent
+- Be concise but complete; prefer showing working SQL over lengthy prose"""
+
+
+def _assistant_fallback_response(req: AssistantChatRequest) -> str:
+    top_issues = req.issues[:3]
+    issue_lines = [
+        f"- `{issue.get('issue_type', 'unknown')}` in `{issue.get('table', 'unknown')}` "
+        f"(severity={issue.get('severity', 'unknown')}, BIS={issue.get('impact_score', 0):.3f})"
+        for issue in top_issues
+    ]
+    lines = [
+        "The remote assistant is running without an OpenRouter key, so this reply is template-only.",
+        "",
+        "You can still inspect the current context:",
+        f"- Schema provided: {'yes' if req.schema_desc.strip() else 'no'}",
+        f"- Ranked issues provided: {len(req.issues)}",
+    ]
+    if issue_lines:
+        lines.extend(["", "Top issues in context:"])
+        lines.extend(issue_lines)
+    lines.extend(
+        [
+            "",
+            "Ask a narrower question such as:",
+            "- `Show me DuckDB SQL to inspect the rows behind the top ranked issue.`",
+            "- `Explain why this foreign-key break is happening.`",
+            "- `Rewrite this failing DuckDB query: ...`",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _assistant_summary_fallback(issues: List[dict], source: str) -> str:
+    if not issues:
+        return f"No ranked issues were supplied for the {source} run, so there is nothing to summarise."
+
+    high_count = sum(1 for issue in issues if issue.get("severity") == "high")
+    top = issues[:3]
+    top_tables = ", ".join(
+        dict.fromkeys(issue.get("table", "unknown") for issue in top if issue.get("table"))
+    ) or "the loaded tables"
+    top_types = ", ".join(issue.get("issue_type", "unknown") for issue in top) or "the ranked issues"
+
+    lines = [
+        (
+            f"The {source} run surfaced {len(issues)} ranked data quality issues, "
+            f"including {high_count} high-severity items. The highest-risk findings are "
+            f"clustered in {top_tables}, with the top problems driven by {top_types}."
+        ),
+        (
+            "The immediate business risk is inaccurate downstream reporting and slower analyst "
+            "triage while root causes remain unresolved."
+        ),
+        "",
+        "Recommended Actions",
+        "- Investigate the highest-ranked issue first and verify the affected upstream ETL step.",
+        "- Re-run the relevant validation query after the fix to confirm row-level recovery.",
+        "- Add a targeted quality check for the same failure mode to catch future regressions earlier.",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Agent Layer endpoints
 # POST /analyze          -- triage + agent explanations + report (async job)
 # POST /explain          -- business explanations for pre-computed issues
 # POST /prioritise       -- AI-ranked priority list with justifications
 # POST /generate-fix     -- SQL + Python fix code for a single issue
 # POST /report           -- executive business summary report
+# POST /assistant/chat   -- SQL assistant response via OpenRouter
+# POST /assistant/summary -- executive summary via OpenRouter
 # ---------------------------------------------------------------------------
 
 class ExplainRequest(BaseModel):
@@ -344,6 +479,64 @@ class AnalyzeRequest(BaseModel):
         if v not in ("clean", "injected"):
             raise ValueError("source must be 'clean' or 'injected'")
         return v
+
+
+@app.post("/assistant/chat")
+def assistant_chat(
+    req: AssistantChatRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return a SQL-assistant chat reply using the API-held OpenRouter key."""
+    from astrion_dq.llm.client import LLMUnavailable, chat_with_history
+
+    history = [msg.model_dump() for msg in req.history]
+    messages = history + [{"role": "user", "content": req.message}]
+    system = _assistant_system_prompt(
+        req.schema_desc or "  (no database loaded)",
+        _assistant_issue_context(req.issues),
+    )
+
+    try:
+        response = chat_with_history(
+            messages,
+            system=system,
+            max_tokens=max(128, min(req.max_tokens, 1600)),
+        )
+        return {"response": response, "used_fallback": False}
+    except LLMUnavailable:
+        return {"response": _assistant_fallback_response(req), "used_fallback": True}
+    except Exception as exc:
+        text = str(exc)
+        if "402" in text and (
+            "credits" in text.lower() or "can only afford" in text.lower()
+        ):
+            return {
+                "response": (
+                    f"**LLM call failed**: {exc}\n\n"
+                    "OpenRouter accepted the API key but rejected the request because the "
+                    "remaining credit/token budget is too low for this response. "
+                    "Add credits or ask a shorter question."
+                ),
+                "used_fallback": True,
+            }
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}") from exc
+
+
+@app.post("/assistant/summary")
+def assistant_summary(
+    req: AssistantSummaryRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return an executive summary using the API-held OpenRouter key."""
+    from astrion_dq.graph.nodes import _llm_executive_summary
+
+    summary = _llm_executive_summary(req.issues, req.source)
+    if summary:
+        return {"summary": summary, "used_fallback": False}
+    return {
+        "summary": _assistant_summary_fallback(req.issues, req.source),
+        "used_fallback": True,
+    }
 
 
 def _run_analyze_job(job_id: str, source: str) -> None:

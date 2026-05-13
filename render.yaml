@@ -6,10 +6,11 @@
 # 2. Go to https://dashboard.render.com → New → Blueprint.
 # 3. Connect your GitHub repo — Render detects this file automatically.
 # 4. Render creates both services in one click.
-# 5. After deploy, set the three secret env vars in each service's Environment tab:
+# 5. After deploy, set the API service secrets in Render's Environment tab:
 #    - OPENROUTER_API_KEY   (get from https://openrouter.ai/keys)
 #    - ASTRION_API_TOKEN    (any secure random string, or leave blank for no auth)
-# 6. Trigger a manual deploy or push to the connected branch to ship.
+# 6. On the dashboard service, set ASTRION_API_TOKEN only if the API is protected.
+# 7. Trigger a manual deploy or push to the connected branch to ship.
 #
 # SERVICES
 # ────────
@@ -17,9 +18,12 @@
 #  astrion-dq-dashboard  Streamlit dashboard → https://astrion-dq-dashboard.onrender.com
 #
 # ENVIRONMENT VARIABLES (set in Render dashboard, not here — never put secrets in YAML)
-#  OPENROUTER_API_KEY   Required for LLM executive summaries + SQL Agent.
-#                       Without it the system still works in template-only mode.
-#  ASTRION_API_TOKEN    Optional Bearer token for FastAPI. Leave blank for open access.
+#  API service:
+#    OPENROUTER_API_KEY   Required for LLM executive summaries + SQL Agent proxy.
+#    ASTRION_API_TOKEN    Optional Bearer token for FastAPI. Leave blank for open access.
+#  Dashboard service:
+#    ASTRION_API_TOKEN        Optional outbound Bearer token used when calling the API.
+#    ASTRION_DASHBOARD_TOKEN  Optional UI login password for Streamlit itself.
 #
 # NOTE: Free-tier Render services spin down after 15 minutes of inactivity.
 #       Cold starts can take 30-60 seconds. Upgrade to Starter ($7/mo) to keep warm.
@@ -79,20 +83,16 @@ services:
     autoDeploy: true
     plan: free
     envVars:
-      # ── LLM (same key — both services need it for SQL Agent / summaries) ──
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: OPENROUTER_MODEL
-        value: anthropic/claude-sonnet-4-6
-      - key: LLM_TOP_N
-        value: "5"
-
-      # ── Link dashboard → API (Streamlit can call the REST API if needed) ──
+      # ── Link dashboard → API (LLM calls are proxied through the API) ─────
       - key: ASTRION_API_URL
         fromService:
           type: web
           name: astrion-dq-api
           envVarKey: RENDER_EXTERNAL_URL
+      - key: ASTRION_API_TOKEN
+        sync: false
+      - key: ASTRION_DASHBOARD_TOKEN
+        sync: false
 
       # ── Python runtime ────────────────────────────────────────────────────
       - key: PYTHONUNBUFFERED
