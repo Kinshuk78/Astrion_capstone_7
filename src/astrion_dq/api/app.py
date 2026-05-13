@@ -14,7 +14,9 @@ Endpoints:
   GET  /outputs/evaluation    -- latest benchmark metrics
   GET  /outputs/report        -- latest markdown report
   GET  /outputs/run-log       -- latest run history entries
+  GET  /assistant/context     -- retail schema context for hosted investigation
   POST /assistant/chat        -- SQL assistant reply via the API-held LLM key
+  POST /assistant/sql         -- execute assistant SQL against retail DuckDB
   POST /assistant/summary     -- executive summary via the API-held LLM key
 
 Authentication:
@@ -47,9 +49,10 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
@@ -73,7 +76,7 @@ app = FastAPI(
         "POST /triage submits an async job; poll GET /jobs/{job_id} for results. "
         "Interactive docs: /docs — OpenAPI spec: /openapi.json"
     ),
-    version="0.6.2",
+    version="0.6.3",
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -164,6 +167,7 @@ class AssistantMessage(BaseModel):
 class AssistantChatRequest(BaseModel):
     message: str
     history: List[AssistantMessage] = Field(default_factory=list)
+    source: str = "injected"
     schema_desc: str = ""
     issues: List[dict] = Field(default_factory=list)
     max_tokens: int = 1200
@@ -175,10 +179,30 @@ class AssistantChatRequest(BaseModel):
             raise ValueError("message must not be empty")
         return v.strip()
 
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        if v not in ("clean", "injected"):
+            raise ValueError("source must be 'clean' or 'injected'")
+        return v
+
 
 class AssistantSummaryRequest(BaseModel):
     issues: List[dict] = Field(default_factory=list)
     source: str = "injected"
+
+
+class AssistantSQLRequest(BaseModel):
+    sql_blocks: List[str] = Field(default_factory=list)
+    source: str = "injected"
+    max_rows: int = 50
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        if v not in ("clean", "injected"):
+            raise ValueError("source must be 'clean' or 'injected'")
+        return v
 
 
 class SnapshotRequest(BaseModel):
@@ -263,6 +287,111 @@ def _read_json_artifact(path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _load_retail_connection_for_source(source: str):
+    """Return a fresh in-memory DuckDB connection for the requested retail source."""
+    from astrion_dq.warehouse.loader import load_retail_tables, load_tables_to_duckdb
+
+    tables = load_retail_tables(source=source)
+    return load_tables_to_duckdb(tables)
+
+
+def _describe_connection_schema(conn) -> str:
+    """Return a compact schema listing for the current DuckDB connection."""
+    schema_lines: list[str] = []
+    try:
+        tables_q = conn.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_type = 'BASE TABLE' "
+            "ORDER BY table_schema, table_name"
+        ).fetchall()
+        for schema, tname in tables_q:
+            full_name = f"{schema}.{tname}" if schema else tname
+            cols_q = conn.execute(
+                "SELECT column_name, data_type "
+                "FROM information_schema.columns "
+                "WHERE table_schema = ? AND table_name = ? "
+                "ORDER BY ordinal_position",
+                [schema or "main", tname],
+            ).fetchall()
+            col_parts = ", ".join(f"{col} {dtype}" for col, dtype in cols_q)
+            schema_lines.append(f"  {full_name} ({col_parts})")
+    except Exception:
+        schema_lines = ["  (schema introspection failed)"]
+    return "\n".join(schema_lines) if schema_lines else "  (no tables found)"
+
+
+def _assistant_schema_context(source: str) -> dict[str, Any]:
+    """Load the requested retail source and return schema metadata for the assistant."""
+    from astrion_dq.warehouse.loader import close_connection
+
+    with _triage_lock:
+        conn = _load_retail_connection_for_source(source)
+        try:
+            return {
+                "source": source,
+                "schema_desc": _describe_connection_schema(conn),
+                "sql_ready": True,
+            }
+        finally:
+            close_connection()
+
+
+def _assistant_execute_sql(source: str, sql_blocks: List[str], max_rows: int = 50) -> list[dict]:
+    """Execute assistant SQL blocks sequentially inside one fresh retail DuckDB session."""
+    from astrion_dq.warehouse.loader import close_connection
+
+    safe_limit = max(1, min(max_rows, 200))
+    cleaned_blocks = [sql.strip() for sql in sql_blocks if sql and sql.strip()]
+    if not cleaned_blocks:
+        return []
+
+    with _triage_lock:
+        conn = _load_retail_connection_for_source(source)
+        try:
+            results: list[dict] = []
+            for sql in cleaned_blocks:
+                try:
+                    cursor = conn.execute(sql)
+                    if cursor.description:
+                        columns = [col[0] for col in cursor.description]
+                        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(safe_limit)]
+                        results.append(
+                            {
+                                "sql": sql,
+                                "columns": columns,
+                                "rows": jsonable_encoder(rows),
+                                "row_count": len(rows),
+                                "message": "",
+                                "error": "",
+                            }
+                        )
+                    else:
+                        results.append(
+                            {
+                                "sql": sql,
+                                "columns": [],
+                                "rows": [],
+                                "row_count": 0,
+                                "message": "Statement executed successfully.",
+                                "error": "",
+                            }
+                        )
+                except Exception as exc:
+                    results.append(
+                        {
+                            "sql": sql,
+                            "columns": [],
+                            "rows": [],
+                            "row_count": 0,
+                            "message": "",
+                            "error": str(exc),
+                        }
+                    )
+            return results
+        finally:
+            close_connection()
 
 
 def _execute_triage(source: str) -> TriageResult:
@@ -546,6 +675,22 @@ def output_run_log(
     return {"entries": _load_run_entries(limit=safe_limit)}
 
 
+@app.get("/assistant/context")
+def assistant_context(
+    source: str = Query("injected", pattern="^(clean|injected)$"),
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return retail schema context for the hosted SQL investigation assistant."""
+    try:
+        return _assistant_schema_context(source)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load assistant context: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # LLM assistant helpers
 # ---------------------------------------------------------------------------
@@ -698,8 +843,14 @@ def assistant_chat(
 
     history = [msg.model_dump() for msg in req.history]
     messages = history + [{"role": "user", "content": req.message}]
+    schema_desc = req.schema_desc.strip()
+    if not schema_desc:
+        try:
+            schema_desc = _assistant_schema_context(req.source).get("schema_desc", "")
+        except Exception:
+            schema_desc = ""
     system = _assistant_system_prompt(
-        req.schema_desc or "  (no database loaded)",
+        schema_desc or "  (no database loaded)",
         _assistant_issue_context(req.issues),
     )
 
@@ -727,6 +878,23 @@ def assistant_chat(
                 "used_fallback": True,
             }
         raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}") from exc
+
+
+@app.post("/assistant/sql")
+def assistant_sql(
+    req: AssistantSQLRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Execute one or more assistant SQL blocks against the requested retail source."""
+    try:
+        results = _assistant_execute_sql(req.source, req.sql_blocks, max_rows=req.max_rows)
+        return {"results": results}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not execute assistant SQL: {exc}") from exc
 
 
 @app.post("/assistant/summary")

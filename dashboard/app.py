@@ -193,6 +193,29 @@ def load_backend_status(source: str = "injected") -> dict[str, Any]:
         }
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def load_remote_assistant_context(source: str = "injected") -> dict[str, Any]:
+    """Fetch remote DuckDB schema context for hosted investigation mode."""
+    if not _API_BASE_URL:
+        return {"available": False, "schema_desc": ""}
+
+    try:
+        payload = _api_json_request(f"/assistant/context?source={source}", timeout=30)
+        return {
+            "available": bool(payload.get("sql_ready")),
+            "schema_desc": str(payload.get("schema_desc") or ""),
+            "source": str(payload.get("source") or source),
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "schema_desc": "",
+            "source": source,
+            "error": str(exc),
+        }
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _fetch_remote_summary(source: str, issues_payload: str) -> dict[str, Any]:
     """Fetch an LLM summary from the Render API using only ranked issue metadata."""
@@ -451,11 +474,12 @@ def _trim_agent_history(history: list[dict], budget_chars: int = 24_000) -> list
 def _sql_agent_respond(user_message: str) -> str:
     """Call the LLM with full conversation history and return the reply."""
     conn, schema_desc = _get_schema_context()
+    current_source = st.session_state.get("src", "injected")
 
     # Build issues context from the last ranked_issues file loaded
     issues = (
         st.session_state.get("_upload_results")
-        or load_ranked_issues(st.session_state.get("src", "injected"))
+        or load_ranked_issues(current_source)
     )
     top_issues = []
     for r in issues[:10]:
@@ -480,6 +504,7 @@ def _sql_agent_respond(user_message: str) -> str:
                         {"role": msg.get("role", ""), "content": msg.get("content", "")}
                         for msg in trimmed
                     ],
+                    "source": current_source,
                     "schema_desc": schema_desc or "  (no database loaded)",
                     "issues": issues[:25],
                     "max_tokens": 1200,
@@ -537,6 +562,47 @@ def _execute_sql_blocks(response: str, conn: duckdb.DuckDBPyConnection) -> list[
         except Exception as exc:
             results.append((sql, f"Error: {exc}"))
     return results
+
+
+def _execute_remote_sql_blocks(response: str, source: str) -> list[tuple[str, object]]:
+    """Execute assistant SQL blocks through the configured Render API."""
+    blocks = re.findall(r"```sql\n(.*?)```", response, re.DOTALL | re.IGNORECASE)
+    cleaned = [block.strip() for block in blocks if block.strip()]
+    if not cleaned:
+        return []
+
+    payload = _api_json_request(
+        "/assistant/sql",
+        {"sql_blocks": cleaned, "source": source, "max_rows": 50},
+        timeout=120,
+    )
+    results: list[tuple[str, object]] = []
+    for item in payload.get("results", []):
+        sql = str(item.get("sql") or "")
+        error = str(item.get("error") or "")
+        if error:
+            results.append((sql, f"Error: {error}"))
+            continue
+
+        rows = item.get("rows") or []
+        columns = item.get("columns") or []
+        if columns:
+            results.append((sql, pd.DataFrame(rows, columns=columns)))
+            continue
+
+        message = str(item.get("message") or "Statement executed successfully.")
+        results.append((sql, message))
+    return results
+
+
+def _render_sql_result(sql: str, result: object) -> None:
+    st.caption(f"Executed: `{sql[:80]}{'...' if len(sql) > 80 else ''}`")
+    if isinstance(result, pd.DataFrame):
+        st.dataframe(result.head(50), use_container_width=True)
+    elif isinstance(result, str) and result.startswith("Error:"):
+        st.error(result)
+    else:
+        st.info(str(result))
 
 
 # ---------------------------------------------------------------------------
@@ -1024,11 +1090,19 @@ def _render_investigation_assistant() -> None:
         )
 
     conn, schema_desc = _get_schema_context()
-    if conn is None:
+    current_source = st.session_state.get("src", "injected")
+    remote_ctx = {"available": False, "schema_desc": "", "error": ""}
+    if conn is None and _API_BASE_URL:
+        remote_ctx = load_remote_assistant_context(current_source)
+        schema_desc = remote_ctx.get("schema_desc", "")
+
+    if conn is None and not schema_desc:
         st.warning(
             "No database is loaded yet. Run **Run Assessment** for the retail warehouse or use "
             "**Ad Hoc Analysis** in Overview to upload CSVs. The assistant can still answer at a high level."
         )
+        if remote_ctx.get("error"):
+            st.caption(f"Remote SQL context is unavailable: {remote_ctx['error']}")
     else:
         with st.expander("Connected schema", expanded=False):
             st.code(schema_desc or "(empty)", language="sql")
@@ -1063,11 +1137,7 @@ def _render_investigation_assistant() -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             for sql, result in msg.get("sql_results", []):
-                st.caption(f"Executed: `{sql[:80]}{'...' if len(sql) > 80 else ''}`")
-                if isinstance(result, pd.DataFrame):
-                    st.dataframe(result.head(50), use_container_width=True)
-                else:
-                    st.error(result)
+                _render_sql_result(sql, result)
 
     if user_input := st.chat_input(
         "Ask the assistant to explain an issue, generate DuckDB SQL, or fix a query"
@@ -1089,12 +1159,16 @@ def _render_investigation_assistant() -> None:
             if conn is not None:
                 results = _execute_sql_blocks(response, conn)
                 for sql, result in results:
-                    st.caption(f"Executed: `{sql[:80]}{'...' if len(sql) > 80 else ''}`")
-                    if isinstance(result, pd.DataFrame):
-                        st.dataframe(result.head(50), use_container_width=True)
-                    else:
-                        st.error(result)
+                    _render_sql_result(sql, result)
                     sql_results.append((sql, result))
+            elif remote_ctx.get("available"):
+                try:
+                    results = _execute_remote_sql_blocks(response, current_source)
+                    for sql, result in results:
+                        _render_sql_result(sql, result)
+                        sql_results.append((sql, result))
+                except Exception as exc:
+                    st.error(f"Remote SQL execution failed: {exc}")
 
         st.session_state["_agent_messages"].append(
             {"role": "assistant", "content": response, "sql_results": sql_results}

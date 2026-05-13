@@ -22,6 +22,7 @@ import json
 import time
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 
@@ -360,6 +361,76 @@ def test_outputs_status_reports_readiness(api_client, tmp_path, monkeypatch):
     assert body["evaluation"] is True
     assert body["run_log"] is True
     assert body["ground_truth"] is True
+
+
+def test_assistant_context_returns_schema(api_client):
+    tables = {
+        "fact_sales": pd.DataFrame(
+            [{"transaction_id": 1, "amount": 42.0}]
+        )
+    }
+    with patch("astrion_dq.warehouse.loader.load_retail_tables", return_value=tables):
+        resp = api_client.get("/assistant/context?source=injected", headers=_AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sql_ready"] is True
+    assert "dq_retail.fact_sales" in body["schema_desc"]
+
+
+def test_assistant_sql_executes_against_requested_source(api_client):
+    tables = {
+        "fact_sales": pd.DataFrame(
+            [{"transaction_id": 1, "amount": 42.0}]
+        )
+    }
+    with patch("astrion_dq.warehouse.loader.load_retail_tables", return_value=tables):
+        resp = api_client.post(
+            "/assistant/sql",
+            json={
+                "source": "injected",
+                "sql_blocks": [
+                    "SELECT transaction_id, amount FROM dq_retail.fact_sales ORDER BY transaction_id"
+                ],
+                "max_rows": 10,
+            },
+            headers=_AUTH,
+        )
+
+    assert resp.status_code == 200
+    result = resp.json()["results"][0]
+    assert result["columns"] == ["transaction_id", "amount"]
+    assert result["rows"][0]["transaction_id"] == 1
+    assert result["rows"][0]["amount"] == 42.0
+
+
+def test_assistant_chat_populates_schema_when_missing(api_client):
+    tables = {
+        "fact_sales": pd.DataFrame(
+            [{"transaction_id": 1, "amount": 42.0}]
+        )
+    }
+
+    def _fake_chat(messages, system: str, max_tokens: int):
+        assert "dq_retail.fact_sales" in system
+        return "ok"
+
+    with patch("astrion_dq.warehouse.loader.load_retail_tables", return_value=tables), \
+         patch("astrion_dq.llm.client.chat_with_history", side_effect=_fake_chat):
+        resp = api_client.post(
+            "/assistant/chat",
+            json={
+                "message": "Show schema",
+                "source": "injected",
+                "history": [],
+                "issues": [],
+                "schema_desc": "",
+            },
+            headers=_AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["response"] == "ok"
 
 
 def test_snapshot_endpoint_returns_path(api_client):
