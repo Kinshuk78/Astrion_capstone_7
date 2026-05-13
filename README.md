@@ -277,6 +277,39 @@ Notes:
 - `Run Triage` in the sidebar refreshes the retail results and makes the retail dataset available to the SQL Assistant.
 - `Upload & Analyze` keeps its own results in the current Streamlit session. Those uploaded results do not overwrite the retail CLI output files shown in `Triage Issues`.
 
+### Deploy this dashboard on Streamlit Community Cloud
+
+Use these values in the Streamlit Community Cloud deploy form:
+
+- **Repository**: `Kinshuk78/Astrion_capstone_7`
+- **Branch**: `main`
+- **Main file path**: `dashboard/app.py`
+- **Python version**: `3.11`
+
+Important:
+
+- Community Cloud executes `streamlit run` from the repository root, which matches this repo layout.
+- The retail demo needs `data/raw/retail/fact_sales_normalized.csv` to be committed to GitHub.
+- If that file is missing from the deployed branch, the app can start but the retail workflow will be incomplete.
+
+Optional secrets:
+
+- `OPENROUTER_API_KEY` to enable the SQL Assistant and LLM summaries
+- `ASTRION_API_TOKEN` to enable the dashboard login gate
+
+You can paste these into Community Cloud's **Advanced settings → Secrets** using
+[.streamlit/secrets.toml.example](/Users/kinshuk/Desktop/Astrion_capstone_7/.streamlit/secrets.toml.example:1)
+as the template.
+
+Deployment flow:
+
+1. Push the repository to GitHub.
+2. Open `https://share.streamlit.io/`.
+3. Click `Create app`.
+4. Select this repository and set the main file to `dashboard/app.py`.
+5. In `Advanced settings`, choose Python `3.11` and optionally paste your secrets.
+6. Click `Deploy`.
+
 ---
 
 ## REST API

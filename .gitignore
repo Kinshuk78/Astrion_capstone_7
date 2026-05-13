@@ -12,6 +12,8 @@ venv/
 config/.env*
 !.env.example
 !config/.env.example
+.streamlit/secrets.toml
+!.streamlit/secrets.toml.example
 
 # Databases
 *.db
@@ -30,7 +32,6 @@ config/.env*
 # Large local fact exports (keep dims in repo; add facts from Kaggle / your mirror)
 data/raw/fact_sales_normalized.csv
 data/raw/fact_sales_denormalized.csv
-data/raw/retail/fact_sales_normalized.csv
 data/raw/hold/
 
 # Generated DuckDB
