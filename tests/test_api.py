@@ -74,6 +74,7 @@ def api_client(tmp_path, monkeypatch):
 
     import astrion_dq.config as cfg
     monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "SNAPSHOTS_DIR", tmp_path / "drift_snapshots")
 
     from fastapi.testclient import TestClient
     from astrion_dq.api.app import app
@@ -88,6 +89,7 @@ def api_client_no_token(tmp_path, monkeypatch):
 
     import astrion_dq.config as cfg
     monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "SNAPSHOTS_DIR", tmp_path / "drift_snapshots")
 
     from fastapi.testclient import TestClient
     from astrion_dq.api.app import app
@@ -264,3 +266,125 @@ def test_get_run_not_found(api_client, tmp_path, monkeypatch):
 
     resp = api_client.get("/runs/doesnotexist", headers=_AUTH)
     assert resp.status_code == 404
+
+
+def test_persist_triage_artifacts_writes_ranked_and_report(tmp_path, monkeypatch):
+    import astrion_dq.config as cfg
+    monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+
+    from astrion_dq.api.app import _persist_triage_artifacts
+
+    _persist_triage_artifacts(
+        "injected",
+        _ranked_issues(),
+        "# Demo report\n\nThis is a report.",
+    )
+
+    ranked_path = tmp_path / "ranked_issues_injected.json"
+    report_path = tmp_path / "triage_report_injected.md"
+    assert ranked_path.exists()
+    assert report_path.exists()
+    assert json.loads(ranked_path.read_text())[0]["issue_id"] == "X001"
+    assert "Demo report" in report_path.read_text()
+
+
+def test_outputs_ranked_issues_returns_artifact(api_client, tmp_path, monkeypatch):
+    import astrion_dq.config as cfg
+    monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+
+    (tmp_path / "ranked_issues_injected.json").write_text(json.dumps(_ranked_issues()))
+    resp = api_client.get("/outputs/ranked-issues?source=injected", headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["issues"][0]["issue_id"] == "X001"
+
+
+def test_outputs_report_returns_content(api_client, tmp_path, monkeypatch):
+    import astrion_dq.config as cfg
+    monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+
+    (tmp_path / "triage_report_injected.md").write_text("# Report\n\nHello")
+    resp = api_client.get("/outputs/report?source=injected", headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["content"].startswith("# Report")
+
+
+def test_outputs_evaluation_returns_results(api_client, tmp_path, monkeypatch):
+    import astrion_dq.config as cfg
+    monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+
+    payload = [{"strategy": "A_baseline", "precision": 1.0}]
+    (tmp_path / "evaluation_comparison.json").write_text(json.dumps(payload))
+    resp = api_client.get("/outputs/evaluation", headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["results"][0]["strategy"] == "A_baseline"
+
+
+def test_outputs_run_log_returns_newest_first(api_client, tmp_path, monkeypatch):
+    import astrion_dq.config as cfg
+    monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+
+    entries = [
+        {"run_id": "old", "timestamp": "2026-01-01T00:00:00+00:00"},
+        {"run_id": "new", "timestamp": "2026-01-02T00:00:00+00:00"},
+    ]
+    (tmp_path / "run_log.jsonl").write_text("\n".join(json.dumps(item) for item in entries))
+    resp = api_client.get("/outputs/run-log?limit=10", headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["entries"][0]["run_id"] == "new"
+
+
+def test_outputs_status_reports_readiness(api_client, tmp_path, monkeypatch):
+    import astrion_dq.config as cfg
+    snapshots_dir = tmp_path / "drift_snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cfg, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "SNAPSHOTS_DIR", snapshots_dir)
+
+    (tmp_path / "ranked_issues_injected.json").write_text(json.dumps(_ranked_issues()))
+    (tmp_path / "triage_report_injected.md").write_text("# Report")
+    (tmp_path / "evaluation_comparison.json").write_text("[]")
+    (tmp_path / "run_log.jsonl").write_text("{}\n")
+    (tmp_path / "retail_injected_issues.json").write_text("[]")
+    (snapshots_dir / "snapshot_baseline.json").write_text("{}")
+
+    resp = api_client.get("/outputs/status?source=injected", headers=_AUTH)
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["baseline_snapshot"] is True
+    assert body["ranked_issues"] is True
+    assert body["report_md"] is True
+    assert body["evaluation"] is True
+    assert body["run_log"] is True
+    assert body["ground_truth"] is True
+
+
+def test_snapshot_endpoint_returns_path(api_client):
+    with patch("astrion_dq.warehouse.loader.load_retail_tables", return_value={"fact_sales": []}), \
+         patch("astrion_dq.checks.drift.save_snapshot", return_value="outputs/drift_snapshots/snapshot_baseline.json"):
+        resp = api_client.post("/snapshot", json={"tag": "baseline"}, headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert "snapshot_baseline.json" in resp.json()["path"]
+
+
+def test_inject_endpoint_returns_issue_count(api_client):
+    with patch("astrion_dq.warehouse.loader.load_retail_tables", return_value={"fact_sales": []}), \
+         patch("astrion_dq.injectors.retail_issues.inject_retail_issues", return_value=({}, [{"issue_id": "X001"}])):
+        resp = api_client.post("/inject", json={"seed": 42}, headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["issue_count"] == 1
+
+
+def test_evaluate_endpoint_returns_results(api_client):
+    payload = [{"strategy": "A_baseline", "precision": 1.0}]
+    with patch("astrion_dq.evaluation.metrics.evaluate_all", return_value=payload):
+        resp = api_client.post("/evaluate", json={"source": "injected"}, headers=_AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json()["results"][0]["strategy"] == "A_baseline"

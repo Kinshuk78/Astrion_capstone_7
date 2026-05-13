@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -118,6 +119,80 @@ def _api_json_request(
         raise RuntimeError(f"Non-JSON response from {url}.") from exc
 
 
+def _api_bytes_request(path: str, timeout: int = 120) -> bytes:
+    """Fetch raw bytes from the configured Render API."""
+    if not _API_BASE_URL:
+        raise RuntimeError("ASTRION_API_URL is not configured.")
+
+    url = f"{_API_BASE_URL}{path}"
+    headers = {}
+    if _API_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {_API_AUTH_TOKEN}"
+
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"{exc.code} {exc.reason}: {detail or 'request failed'}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
+
+
+def _poll_remote_job(job_id: str, timeout_seconds: int = 180) -> dict[str, Any]:
+    """Poll a remote triage job until it completes or times out."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = _api_json_request(f"/jobs/{job_id}", timeout=60)
+        if result.get("status") != "running":
+            return result
+        time.sleep(1.0)
+    raise RuntimeError(f"Timed out waiting for remote job {job_id}.")
+
+
+def _run_remote_triage(source: str) -> tuple[bool, str]:
+    submit = _api_json_request("/triage", {"source": source}, timeout=60)
+    job_id = str(submit.get("job_id") or "")
+    if not job_id:
+        return False, "Remote triage did not return a job_id."
+
+    result = _poll_remote_job(job_id)
+    if result.get("status") == "done":
+        return True, f"Assessment complete (job {job_id})."
+    return False, str(result.get("error") or f"Remote job {job_id} failed.")
+
+
+def _run_remote_operation(path: str, payload: Optional[dict[str, Any]] = None) -> tuple[bool, str]:
+    try:
+        result = _api_json_request(path, payload or {}, timeout=180)
+        return True, str(result.get("status") or "ok")
+    except Exception as exc:
+        return False, str(exc)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_backend_status(source: str = "injected") -> dict[str, Any]:
+    """Return API connectivity plus remote artifact readiness flags."""
+    if not _API_BASE_URL:
+        return {"api_connected": False, "mode": "local"}
+
+    try:
+        health = _api_json_request("/health", timeout=20)
+        status = _api_json_request(f"/outputs/status?source={source}", timeout=20)
+        return {
+            "mode": "remote",
+            "api_connected": health.get("status") == "ok",
+            **status,
+        }
+    except Exception as exc:
+        return {
+            "mode": "remote_error",
+            "api_connected": False,
+            "error": str(exc),
+        }
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _fetch_remote_summary(source: str, issues_payload: str) -> dict[str, Any]:
     """Fetch an LLM summary from the Render API using only ranked issue metadata."""
@@ -159,6 +234,11 @@ if _expected_token:
 
 @st.cache_data(ttl=30)
 def load_ranked_issues(source: str = "injected") -> list:
+    if _API_BASE_URL:
+        try:
+            return _api_json_request(f"/outputs/ranked-issues?source={source}", timeout=30).get("issues", [])
+        except Exception:
+            return []
     path = OUTPUTS_DIR / f"ranked_issues_{source}.json"
     if not path.exists():
         return []
@@ -167,6 +247,11 @@ def load_ranked_issues(source: str = "injected") -> list:
 
 @st.cache_data(ttl=30)
 def load_evaluation() -> list:
+    if _API_BASE_URL:
+        try:
+            return _api_json_request("/outputs/evaluation", timeout=30).get("results", [])
+        except Exception:
+            return []
     path = OUTPUTS_DIR / "evaluation_comparison.json"
     if not path.exists():
         return []
@@ -175,6 +260,11 @@ def load_evaluation() -> list:
 
 @st.cache_data(ttl=30)
 def load_report_md(source: str = "injected") -> Optional[str]:
+    if _API_BASE_URL:
+        try:
+            return _api_json_request(f"/outputs/report?source={source}", timeout=30).get("content") or None
+        except Exception:
+            return None
     path = OUTPUTS_DIR / f"triage_report_{source}.md"
     if not path.exists():
         return None
@@ -184,6 +274,11 @@ def load_report_md(source: str = "injected") -> Optional[str]:
 @st.cache_data(ttl=10)
 def load_run_log() -> list:
     """Load all entries from outputs/run_log.jsonl, most-recent first."""
+    if _API_BASE_URL:
+        try:
+            return _api_json_request("/outputs/run-log?limit=100", timeout=30).get("entries", [])
+        except Exception:
+            return []
     path = OUTPUTS_DIR / "run_log.jsonl"
     if not path.exists():
         return []
@@ -206,12 +301,17 @@ def load_run_log() -> list:
 def run_cli(cmd: list) -> tuple[bool, str]:
     """Run an astrion_dq.cli command and return (success, combined_output)."""
     try:
+        env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        src_path = str(PROJECT_ROOT / "src")
+        env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}{os.pathsep}{existing_pythonpath}"
         result = subprocess.run(
             [sys.executable, "-m", "astrion_dq.cli"] + cmd,
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
             timeout=300,
+            env=env,
         )
         output = result.stdout + result.stderr
         return result.returncode == 0, output
@@ -1173,6 +1273,13 @@ with st.sidebar:
     run_entries = load_run_log()
     latest_run = run_entries[0] if run_entries else {}
     latest_run_label = _format_run_timestamp(latest_run.get("timestamp", ""))
+    backend_status = load_backend_status(st.session_state.get("src", "injected"))
+    baseline_ready = bool(
+        backend_status.get("baseline_snapshot", False)
+        if _API_BASE_URL else
+        snapshot_path.exists()
+    )
+    api_mode_label = "Connected" if backend_status.get("api_connected") else ("Local" if not _API_BASE_URL else "Unavailable")
 
     st.title("Astrion DQ")
     st.caption("Enterprise Data Quality Command Center")
@@ -1187,15 +1294,27 @@ with st.sidebar:
 
     st.subheader("Operational Context")
     data_source = st.selectbox("Active dataset", ["injected", "clean"], key="src")
+    backend_status = load_backend_status(data_source)
+    baseline_ready = bool(
+        backend_status.get("baseline_snapshot", False)
+        if _API_BASE_URL else
+        snapshot_path.exists()
+    )
+    api_mode_label = "Connected" if backend_status.get("api_connected") else ("Local" if not _API_BASE_URL else "Unavailable")
     st.caption(f"Last recorded run: {latest_run_label}")
-    st.caption(f"Baseline snapshot: {'Ready' if snapshot_path.exists() else 'Not set'}")
-    st.caption(f"API mode: {'Connected' if _API_BASE_URL else 'Local'}")
+    st.caption(f"Baseline snapshot: {'Ready' if baseline_ready else 'Not set'}")
+    st.caption(f"API mode: {api_mode_label}")
+    if _API_BASE_URL and not backend_status.get("api_connected"):
+        st.caption(f"API error: {backend_status.get('error', 'Unreachable')}")
 
     _running = st.session_state.get("_running", False)
     if st.button("Run Assessment", use_container_width=True, type="primary", disabled=_running):
         st.session_state["_running"] = True
         with st.spinner(f"Running assessment on {data_source!r}..."):
-            ok, out = run_cli(["triage", "--source", data_source, "--sensitivity", "high"])
+            if _API_BASE_URL:
+                ok, out = _run_remote_triage(data_source)
+            else:
+                ok, out = run_cli(["triage", "--source", data_source, "--sensitivity", "high"])
         st.session_state["_running"] = False
         if ok:
             _ensure_retail_live_connection(data_source)
@@ -1211,15 +1330,34 @@ with st.sidebar:
             st.rerun()
     with action_col2:
         if st.button("Export PDF", use_container_width=True, disabled=_running, key="export_dashboard_pdf"):
-            st.session_state["_running"] = True
-            with st.spinner("Preparing PDF report..."):
-                ok, out = run_cli(["report", "--source", data_source])
-            st.session_state["_running"] = False
-            if ok:
-                st.success("PDF report prepared.")
-                st.cache_data.clear()
+            if _API_BASE_URL:
+                try:
+                    pdf_bytes = _api_bytes_request(f"/triage/report.pdf?source={data_source}", timeout=180)
+                    st.session_state["_report_pdf_bytes"] = pdf_bytes
+                    st.session_state["_report_pdf_name"] = f"triage_report_{data_source}.pdf"
+                    st.success("PDF report is ready for download below.")
+                except Exception as exc:
+                    st.error(f"Failed:\n{str(exc)[:400]}")
             else:
-                st.error(f"Failed:\n{out[:400]}")
+                st.session_state["_running"] = True
+                with st.spinner("Preparing PDF report..."):
+                    ok, out = run_cli(["report", "--source", data_source])
+                st.session_state["_running"] = False
+                if ok:
+                    st.success("PDF report prepared.")
+                    st.cache_data.clear()
+                else:
+                    st.error(f"Failed:\n{out[:400]}")
+
+    if st.session_state.get("_report_pdf_bytes"):
+        st.download_button(
+            "Download Current PDF",
+            data=st.session_state["_report_pdf_bytes"],
+            file_name=st.session_state.get("_report_pdf_name", f"triage_report_{data_source}.pdf"),
+            mime="application/pdf",
+            use_container_width=True,
+            key="sidebar_download_pdf",
+        )
 
     with st.expander("Admin & Demo Tools", expanded=False):
         st.caption(
@@ -1229,7 +1367,10 @@ with st.sidebar:
         if st.button("Set Baseline", use_container_width=True, disabled=_running, key="set_baseline"):
             st.session_state["_running"] = True
             with st.spinner("Saving baseline snapshot..."):
-                ok, out = run_cli(["snapshot"])
+                if _API_BASE_URL:
+                    ok, out = _run_remote_operation("/snapshot", {"tag": "baseline"})
+                else:
+                    ok, out = run_cli(["snapshot"])
             st.session_state["_running"] = False
             if ok:
                 st.success("Baseline updated.")
@@ -1240,7 +1381,10 @@ with st.sidebar:
         if st.button("Load Demo Data", use_container_width=True, disabled=_running, key="load_demo_data"):
             st.session_state["_running"] = True
             with st.spinner("Injecting synthetic demo issues..."):
-                ok, out = run_cli(["inject"])
+                if _API_BASE_URL:
+                    ok, out = _run_remote_operation("/inject", {"seed": 42})
+                else:
+                    ok, out = run_cli(["inject"])
             st.session_state["_running"] = False
             if ok:
                 st.success("Demo scenario loaded.")
@@ -1251,7 +1395,10 @@ with st.sidebar:
         if st.button("Benchmark Engine", use_container_width=True, disabled=_running, key="benchmark_engine"):
             st.session_state["_running"] = True
             with st.spinner("Evaluating workflow strategies..."):
-                ok, out = run_cli(["evaluate", "--source", "injected"])
+                if _API_BASE_URL:
+                    ok, out = _run_remote_operation("/evaluate", {"source": "injected"})
+                else:
+                    ok, out = run_cli(["evaluate", "--source", "injected"])
             st.session_state["_running"] = False
             if ok:
                 st.success("Benchmark complete.")
@@ -1270,6 +1417,13 @@ run_entries = load_run_log()
 latest_run_for_source = next((entry for entry in run_entries if entry.get("source") == data_source), {})
 latest_run_label = _format_run_timestamp(latest_run_for_source.get("timestamp", ""))
 metrics = _issue_metrics(issues) if issues else None
+backend_status = load_backend_status(data_source)
+baseline_ready = bool(
+    backend_status.get("baseline_snapshot", False)
+    if _API_BASE_URL else
+    snapshot_path.exists()
+)
+api_mode_label = "Connected" if backend_status.get("api_connected") else ("Local" if not _API_BASE_URL else "Unavailable")
 summary_text = ""
 summary_error = ""
 if _API_BASE_URL and issues:
@@ -1282,8 +1436,8 @@ if _API_BASE_URL and issues:
 
 status_pills = [
     f"Dataset: {source_labels.get(data_source, data_source.title())}",
-    f"Baseline: {'Ready' if snapshot_path.exists() else 'Not Set'}",
-    f"API: {'Connected' if _API_BASE_URL else 'Local'}",
+    f"Baseline: {'Ready' if baseline_ready else 'Not Set'}",
+    f"API: {api_mode_label}",
     f"Last Run: {latest_run_label}",
 ]
 if st.session_state.get("_upload_results") is not None:

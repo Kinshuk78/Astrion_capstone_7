@@ -6,6 +6,14 @@ Endpoints:
   GET  /jobs/{job_id}         -- poll job status and result
   GET  /runs/{run_id}         -- look up a past run from outputs/run_log.jsonl
   GET  /triage/report.pdf     -- generate and download a PDF report
+  POST /snapshot              -- save the baseline drift snapshot
+  POST /inject                -- seed injected demo issues
+  POST /evaluate              -- run workflow benchmark metrics
+  GET  /outputs/status        -- artifact readiness summary
+  GET  /outputs/ranked-issues -- latest ranked issue list
+  GET  /outputs/evaluation    -- latest benchmark metrics
+  GET  /outputs/report        -- latest markdown report
+  GET  /outputs/run-log       -- latest run history entries
   POST /assistant/chat        -- SQL assistant reply via the API-held LLM key
   POST /assistant/summary     -- executive summary via the API-held LLM key
 
@@ -65,7 +73,7 @@ app = FastAPI(
         "POST /triage submits an async job; poll GET /jobs/{job_id} for results. "
         "Interactive docs: /docs — OpenAPI spec: /openapi.json"
     ),
-    version="0.6.1",
+    version="0.6.2",
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -173,6 +181,25 @@ class AssistantSummaryRequest(BaseModel):
     source: str = "injected"
 
 
+class SnapshotRequest(BaseModel):
+    tag: str = "baseline"
+
+
+class InjectRequest(BaseModel):
+    seed: int = 42
+
+
+class EvaluateRequest(BaseModel):
+    source: str = "injected"
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        if v not in ("clean", "injected"):
+            raise ValueError("source must be 'clean' or 'injected'")
+        return v
+
+
 # ---------------------------------------------------------------------------
 # Background triage worker
 # ---------------------------------------------------------------------------
@@ -188,6 +215,54 @@ def _write_run_log(entry: dict) -> None:
             fh.write(json.dumps(entry) + "\n")
     except Exception as exc:
         logger.warning("Could not write run_log.jsonl (ephemeral filesystem?): %s", exc)
+
+
+def _persist_triage_artifacts(source: str, ranked: List[dict], report_md: str = "") -> None:
+    """Persist the same triage outputs as the CLI for dashboard consumers."""
+    try:
+        from astrion_dq.config import OUTPUTS_DIR
+
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        ranked_path = OUTPUTS_DIR / f"ranked_issues_{source}.json"
+        ranked_path.write_text(json.dumps(ranked, indent=2), encoding="utf-8")
+        if report_md:
+            report_path = OUTPUTS_DIR / f"triage_report_{source}.md"
+            report_path.write_text(report_md, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Could not persist triage outputs: %s", exc)
+
+
+def _load_run_entries(limit: int | None = None) -> list[dict]:
+    """Return run log entries, newest first."""
+    from astrion_dq.config import OUTPUTS_DIR
+
+    log_path = OUTPUTS_DIR / "run_log.jsonl"
+    if not log_path.exists():
+        return []
+
+    entries: list[dict] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    entries.reverse()
+    if limit is not None:
+        return entries[:limit]
+    return entries
+
+
+def _read_json_artifact(path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
 def _execute_triage(source: str) -> TriageResult:
@@ -209,7 +284,10 @@ def _execute_triage(source: str) -> TriageResult:
 
     ranked = result.get("ranked_issues") or []
     agent_trace = result.get("agent_trace") or []
+    report_md = result.get("report_md") or ""
     run_id = uuid.uuid4().hex[:12]
+
+    _persist_triage_artifacts(source, ranked, report_md)
 
     _write_run_log({
         "run_id": run_id,
@@ -337,6 +415,135 @@ def get_run(
                 return entry
 
     raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+
+
+# ---------------------------------------------------------------------------
+# Operational endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/snapshot")
+def save_baseline_snapshot(
+    req: SnapshotRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Persist a baseline drift snapshot for later comparisons."""
+    from astrion_dq.checks.drift import save_snapshot
+    from astrion_dq.warehouse.loader import load_retail_tables
+
+    tables = load_retail_tables(source="clean")
+    path = save_snapshot(tables, tag=req.tag)
+    return {"status": "ok", "tag": req.tag, "path": str(path)}
+
+
+@app.post("/inject")
+def inject_demo_data(
+    req: InjectRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Create the injected retail demo dataset and ground-truth issue file."""
+    from astrion_dq.injectors.retail_issues import inject_retail_issues
+    from astrion_dq.warehouse.loader import load_retail_tables
+
+    tables = load_retail_tables(source="clean")
+    _, issues = inject_retail_issues(tables, seed=req.seed)
+    return {"status": "ok", "seed": req.seed, "issue_count": len(issues)}
+
+
+@app.post("/evaluate")
+def evaluate_workflow(
+    req: EvaluateRequest,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Run the A/B/C workflow benchmark and persist the comparison output."""
+    from astrion_dq.evaluation.metrics import evaluate_all
+
+    os.environ["ASTRION_AUTO_APPROVE"] = "1"
+    try:
+        results = evaluate_all(source=req.source, save=True)
+    finally:
+        os.environ.pop("ASTRION_AUTO_APPROVE", None)
+    return {"status": "ok", "source": req.source, "results": results}
+
+
+@app.get("/outputs/status")
+def output_status(
+    source: str = "injected",
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return readiness flags for dashboard-facing output artifacts."""
+    from astrion_dq.config import OUTPUTS_DIR, SNAPSHOTS_DIR
+
+    if source not in ("clean", "injected"):
+        raise HTTPException(status_code=422, detail="source must be 'clean' or 'injected'")
+
+    ranked_path = OUTPUTS_DIR / f"ranked_issues_{source}.json"
+    report_path = OUTPUTS_DIR / f"triage_report_{source}.md"
+    eval_path = OUTPUTS_DIR / "evaluation_comparison.json"
+    run_log_path = OUTPUTS_DIR / "run_log.jsonl"
+    injected_gt_path = OUTPUTS_DIR / "retail_injected_issues.json"
+    baseline_path = SNAPSHOTS_DIR / "snapshot_baseline.json"
+    return {
+        "source": source,
+        "api_connected": True,
+        "baseline_snapshot": baseline_path.exists(),
+        "ranked_issues": ranked_path.exists(),
+        "report_md": report_path.exists(),
+        "evaluation": eval_path.exists(),
+        "run_log": run_log_path.exists(),
+        "ground_truth": injected_gt_path.exists(),
+    }
+
+
+@app.get("/outputs/ranked-issues")
+def output_ranked_issues(
+    source: str = "injected",
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return the latest ranked issue list for the selected source."""
+    from astrion_dq.config import OUTPUTS_DIR
+
+    if source not in ("clean", "injected"):
+        raise HTTPException(status_code=422, detail="source must be 'clean' or 'injected'")
+
+    path = OUTPUTS_DIR / f"ranked_issues_{source}.json"
+    return {"source": source, "issues": _read_json_artifact(path, [])}
+
+
+@app.get("/outputs/evaluation")
+def output_evaluation(
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return the latest saved workflow benchmark metrics."""
+    from astrion_dq.config import OUTPUTS_DIR
+
+    path = OUTPUTS_DIR / "evaluation_comparison.json"
+    return {"results": _read_json_artifact(path, [])}
+
+
+@app.get("/outputs/report")
+def output_report(
+    source: str = "injected",
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return the latest saved markdown report for the selected source."""
+    from astrion_dq.config import OUTPUTS_DIR
+
+    if source not in ("clean", "injected"):
+        raise HTTPException(status_code=422, detail="source must be 'clean' or 'injected'")
+
+    path = OUTPUTS_DIR / f"triage_report_{source}.md"
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    return {"source": source, "content": content}
+
+
+@app.get("/outputs/run-log")
+def output_run_log(
+    limit: int = 50,
+    _auth: None = Depends(_require_token),
+) -> dict:
+    """Return recent run-log entries, newest first."""
+    safe_limit = max(1, min(limit, 500))
+    return {"entries": _load_run_entries(limit=safe_limit)}
 
 
 # ---------------------------------------------------------------------------
